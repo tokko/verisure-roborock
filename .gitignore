@@ -1,0 +1,4 @@
+.env
+dist/
+state.json
+state.json.tmp

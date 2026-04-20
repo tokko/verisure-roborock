@@ -1,0 +1,14 @@
+[Unit]
+Description=Verisure-Roborock automation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/verisure-roborock/env
+ExecStart=/usr/local/bin/verisure-roborock
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
