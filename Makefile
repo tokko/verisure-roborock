@@ -30,3 +30,8 @@ build-linux:
 
 build-linux-arm64:
 	GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o dist/verisure-roborock-linux-arm64 $(CMD)
+
+# Fetch Roborock device tokens from Xiaomi cloud using your Mi Home credentials.
+# Output is ready to paste into .env.
+fetch-tokens:
+	go run ./cmd/fetch-tokens
