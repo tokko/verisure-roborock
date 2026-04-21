@@ -78,17 +78,23 @@ func fetchViaRoborock(ctx context.Context, email, region string) ([]tokenDevice,
 		return nil, err
 	}
 
-	fmt.Fprintf(os.Stderr, "Sending verification code to %s...\n", email)
-	msg, err := client.RequestEmailCode(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("send code: %w", err)
+	// Allow non-interactive use: ROBOROCK_VERIFY_CODE=XXXXXX skips sending a
+	// new email code (so we don't invalidate a code we already have).
+	code := os.Getenv("ROBOROCK_VERIFY_CODE")
+	if code != "" {
+		fmt.Fprintf(os.Stderr, "Using code from ROBOROCK_VERIFY_CODE env var (skipping email send).\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "Sending verification code to %s...\n", email)
+		msg, err := client.RequestEmailCode(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("send code: %w", err)
+		}
+		if msg != "" {
+			fmt.Fprintf(os.Stderr, "API response: %s\n", msg)
+		}
+		fmt.Fprint(os.Stderr, "Enter the code from your email (check spam too): ")
+		code = readLine()
 	}
-	if msg != "" {
-		fmt.Fprintf(os.Stderr, "API response: %s\n", msg)
-	}
-
-	fmt.Fprint(os.Stderr, "Enter the code from your email (check spam too): ")
-	code := readLine()
 	if code == "" {
 		return nil, fmt.Errorf("no code entered")
 	}
@@ -105,13 +111,9 @@ func fetchViaRoborock(ctx context.Context, email, region string) ([]tokenDevice,
 
 	var out []tokenDevice
 	for _, d := range cloudDevices {
-		ip := ""
-		if d.NetworkInfo != nil {
-			ip = d.NetworkInfo.LocalIP
-		}
 		out = append(out, tokenDevice{
 			Name:  d.Name,
-			IP:    ip,
+			IP:    d.LocalIP(),
 			Token: d.LocalKey,
 		})
 	}
