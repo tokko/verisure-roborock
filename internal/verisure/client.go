@@ -85,11 +85,13 @@ func (c *Client) SubmitMFACode(code string) {
 }
 
 func (c *Client) SessionCookie() string {
+	// The API now returns vs-access (JWT) instead of vid. Persist whichever
+	// session cookie we have so we can resume without re-authenticating.
 	for _, base := range []string{c.apiBase, "https://www.verisure.com"} {
 		u, _ := url.Parse(base)
 		for _, cookie := range c.jar.Cookies(u) {
-			if cookie.Name == "vid" {
-				return cookie.Value
+			if cookie.Name == "vs-access" || cookie.Name == "vid" {
+				return cookie.Name + "=" + cookie.Value
 			}
 		}
 	}
@@ -268,7 +270,7 @@ func (c *Client) validateMFALocked(ctx context.Context, state *mfaState) error {
 		return ctx.Err()
 	}
 
-	payload, _ := json.Marshal(mfaValidateRequest{Code: code, Trust: false})
+	payload, _ := json.Marshal(mfaValidateRequest{Token: code, Trust: false})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		state.loginBase+"/auth/mfa/validate", bytes.NewReader(payload))
 	if err != nil {

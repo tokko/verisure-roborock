@@ -20,8 +20,9 @@ func (a ArmState) IsDisengaged() bool {
 }
 
 // mfaValidateRequest submits the SMS code to /auth/mfa/validate.
+// Field name is "token" (not "code") — confirmed by direct API testing.
 type mfaValidateRequest struct {
-	Code  string `json:"code"`
+	Token string `json:"token"`
 	Trust bool   `json:"trust"` // false = don't persist trust on this device
 }
 
