@@ -35,8 +35,8 @@ func main() {
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
 
-	email := firstNonEmpty(os.Getenv("XIAOMI_EMAIL"), os.Getenv("VERISURE_EMAIL"))
-	password := firstNonEmpty(os.Getenv("XIAOMI_PASSWORD"), os.Getenv("VERISURE_PASSWORD"))
+	email := firstNonEmpty(os.Getenv("ROBOROCK_EMAIL"), os.Getenv("XIAOMI_EMAIL"), os.Getenv("VERISURE_EMAIL"))
+	password := firstNonEmpty(os.Getenv("ROBOROCK_PASSWORD"), os.Getenv("XIAOMI_PASSWORD"), os.Getenv("VERISURE_PASSWORD"))
 	country := firstNonEmpty(os.Getenv("XIAOMI_COUNTRY"), "de")
 
 	if email == "" {

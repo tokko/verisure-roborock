@@ -25,9 +25,13 @@ type Config struct {
 	VerisureBaseURL  string
 	VerisureMFAPhone string // SMS 2FA phone number
 
-	// Xiaomi cloud (for token fetching — same credentials as Roborock app)
-	XiaomiEmail    string // defaults to VerisureEmail if same account
-	XiaomiPassword string // defaults to VerisurePassword if same account
+	// Roborock account (for 'make fetch-tokens' — may differ from Verisure)
+	RoborockEmail    string // falls back to XiaomiEmail then VerisureEmail
+	RoborockPassword string // falls back to XiaomiPassword then VerisurePassword
+
+	// Xiaomi cloud (alternative backend for Mi Home app users)
+	XiaomiEmail    string
+	XiaomiPassword string
 	XiaomiCountry  string // EU=de, US=us, etc.
 
 	// Roborock vacuums (one or more)
@@ -89,7 +93,10 @@ func Load() (*Config, error) {
 		VerisureBaseURL:  optional("VERISURE_BASE_URL", "https://e-api01.verisure.com/xbn/2"),
 		VerisureMFAPhone: optional("VERISURE_MFA_PHONE", ""),
 
-		// Xiaomi defaults to same credentials as Verisure (common for users with one account)
+		// Roborock account — falls back through Xiaomi then Verisure credentials.
+		RoborockEmail:    optional("ROBOROCK_EMAIL", optional("XIAOMI_EMAIL", verisureEmail)),
+		RoborockPassword: optional("ROBOROCK_PASSWORD", optional("XIAOMI_PASSWORD", verisurePassword)),
+
 		XiaomiEmail:    optional("XIAOMI_EMAIL", verisureEmail),
 		XiaomiPassword: optional("XIAOMI_PASSWORD", verisurePassword),
 		XiaomiCountry:  optional("XIAOMI_COUNTRY", "de"), // EU server

@@ -83,8 +83,10 @@ All configuration is via environment variables (or `.env`). Run `make fetch-toke
 | `VERISURE_GIID` | no | auto | Installation ID (auto-discovered) |
 | `VERISURE_BASE_URL` | no | `https://e-api01.verisure.com/xbn/2` | Override for non-EU |
 | `VERISURE_MFA_PHONE` | no | — | Phone number for SMS 2FA |
-| `XIAOMI_EMAIL` | no | `VERISURE_EMAIL` | Mi Home email (if different) |
-| `XIAOMI_PASSWORD` | no | `VERISURE_PASSWORD` | Mi Home password (if different) |
+| `ROBOROCK_EMAIL` | no | `VERISURE_EMAIL` | Roborock account email (if different from Verisure) |
+| `ROBOROCK_PASSWORD` | no | `VERISURE_PASSWORD` | Roborock account password (if different) |
+| `XIAOMI_EMAIL` | no | `VERISURE_EMAIL` | Mi Home email (Mi Home app users only) |
+| `XIAOMI_PASSWORD` | no | `VERISURE_PASSWORD` | Mi Home password (Mi Home app users only) |
 | `XIAOMI_COUNTRY` | no | `de` | Cloud region: `de` EU, `us`, `sg`, `cn` |
 | `ROBOROCK_0_HOST` | yes | — | First vacuum local IP |
 | `ROBOROCK_0_TOKEN` | yes | — | First vacuum token (from `make fetch-tokens`) |
