@@ -19,6 +19,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -173,7 +174,7 @@ func printEnv(devices []tokenDevice) {
 			ip = "<check your router DHCP table>"
 		}
 		name := sanitizeName(d.Name)
-		token := d.Token
+		token := normaliseToken(d.Token)
 		if token == "" {
 			token = "<not available>"
 		}
@@ -203,6 +204,29 @@ func sanitizeName(name string) string {
 		return "vacuum"
 	}
 	return s
+}
+
+// normaliseToken converts a Roborock cloud localKey to the 32-char hex format
+// expected by NewClient. The cloud returns a 16-char raw ASCII string; we
+// hex-encode its bytes to produce the 32-char hex string.
+// If the token is already 32 lowercase hex chars (Mi Home format), it is
+// returned unchanged.
+func normaliseToken(t string) string {
+	if t == "" {
+		return ""
+	}
+	// Already a 32-char hex string (Mi Home / older API format).
+	if len(t) == 32 {
+		if _, err := hex.DecodeString(t); err == nil {
+			return strings.ToLower(t)
+		}
+	}
+	// 16-char raw string (Roborock cloud format) → hex-encode.
+	if len(t) == 16 {
+		return hex.EncodeToString([]byte(t))
+	}
+	// Unknown — return as-is and let the runtime validate.
+	return t
 }
 
 func firstNonEmpty(vals ...string) string {
