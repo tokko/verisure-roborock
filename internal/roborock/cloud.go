@@ -4,13 +4,13 @@
 package roborock
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -73,9 +73,9 @@ func (c *CloudClient) RequestEmailCode(ctx context.Context) (string, error) {
 		Msg  string `json:"msg"`
 		Data any    `json:"data"`
 	}
-	if err := c.post(ctx, "/api/v1/sendEmailCode", map[string]string{
-		"username": c.username,
-		"type":     "auth",
+	if err := c.postForm(ctx, "/api/v1/sendEmailCode", url.Values{
+		"username": {c.username},
+		"type":     {"auth"},
 	}, &resp); err != nil {
 		return "", err
 	}
@@ -97,10 +97,10 @@ func (c *CloudClient) LoginWithCode(ctx context.Context, code string) error {
 		Msg string `json:"msg"`
 	}
 
-	if err := c.post(ctx, "/api/v1/login/email", map[string]string{
-		"username":       c.username,
-		"verifycode":     strings.TrimSpace(code),
-		"verifycodetype": "AUTH_EMAIL_CODE",
+	if err := c.postForm(ctx, "/api/v1/login/email", url.Values{
+		"username":       {c.username},
+		"verifycode":     {strings.TrimSpace(code)},
+		"verifycodetype": {"AUTH_EMAIL_CODE"},
 	}, &resp); err != nil {
 		return err
 	}
@@ -164,16 +164,15 @@ func (c *CloudClient) Devices(ctx context.Context) ([]CloudDevice, error) {
 	return devices, nil
 }
 
-func (c *CloudClient) post(ctx context.Context, path string, body, out any) error {
-	b, err := json.Marshal(body)
+// postForm sends a POST with application/x-www-form-urlencoded body.
+// The Roborock API uses form encoding, not JSON, for auth endpoints.
+func (c *CloudClient) postForm(ctx context.Context, path string, form url.Values, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+path, strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
