@@ -19,20 +19,9 @@ func (a ArmState) IsDisengaged() bool {
 	return a == ArmStateDisarmed || a == ArmStateArmedHome
 }
 
-// loginRequest is the body for POST /cookie.
-type loginRequest struct {
-	Login    string `json:"login"`
-	Password string `json:"password"`
-}
-
-// mfaRequest triggers SMS dispatch to the registered phone.
-type mfaRequest struct {
-	CallMe bool `json:"callMe"`
-}
-
-// mfaCodeRequest submits the received SMS code.
-type mfaCodeRequest struct {
-	Token string `json:"token"`
+// mfaValidateRequest submits the SMS code to /auth/mfa/validate.
+type mfaValidateRequest struct {
+	Code string `json:"code"`
 }
 
 // installationsResponse is the response from GET /installation.

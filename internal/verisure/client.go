@@ -10,18 +10,30 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"strings"
 	"sync"
 )
 
+const (
+	// applicationID is the header value the Verisure app API expects.
+	applicationID = "PS_PYTHON"
+
+	// defaultLoginBase is the primary authentication server.
+	defaultLoginBase = "https://automation01.verisure.com"
+
+	// fallbackLoginBase is tried if the primary returns an error.
+	fallbackLoginBase = "https://automation02.verisure.com"
+)
+
 // Client is a Verisure REST API client with session cookie management.
-// Authentication is session-cookie based (the "vid" cookie).
-// If 2FA is configured, the client will trigger an SMS and block until
-// a code is submitted via SubmitMFACode.
+// Authentication uses HTTP Basic Auth against automation01.verisure.com.
+// If 2FA is configured the client triggers an SMS and blocks until a code
+// is submitted via SubmitMFACode.
 type Client struct {
-	baseURL  string
+	apiBase  string // e-api01.verisure.com/xbn/2 — data calls
 	email    string
 	password string
-	phone    string // MFA phone number
+	phone    string // MFA phone number (informational only — SMS is automatic)
 
 	http   *http.Client
 	jar    *cookiejar.Jar
@@ -29,20 +41,24 @@ type Client struct {
 	authed bool
 	giid   string // installation ID, discovered on first login
 
+	// stepupCookie holds the vs-stepup cookie value across the MFA flow.
+	stepupCookie string
+
 	// mfaCh receives the SMS code from the HTTP handler (see SubmitMFACode).
 	mfaCh chan string
 }
 
-// NewClient creates a Verisure client. Provide an optional persisted cookie
-// value (from store.State.VerisureCookie) to resume a previous session.
-func NewClient(baseURL, email, password, phone, persistedCookie string) (*Client, error) {
+// NewClient creates a Verisure client.
+// apiBase is the data API base URL (e.g. "https://e-api01.verisure.com/xbn/2").
+// Provide persistedCookie to resume a previous session without re-authenticating.
+func NewClient(apiBase, email, password, phone, persistedCookie string) (*Client, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, err
 	}
 
 	c := &Client{
-		baseURL:  baseURL,
+		apiBase:  apiBase,
 		email:    email,
 		password: password,
 		phone:    phone,
@@ -51,18 +67,13 @@ func NewClient(baseURL, email, password, phone, persistedCookie string) (*Client
 	}
 	c.http = &http.Client{
 		Jar: jar,
-		// Do not follow redirects automatically — we check them manually.
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
 
-	// Restore persisted session cookie if provided.
 	if persistedCookie != "" {
-		u, _ := url.Parse(baseURL)
-		jar.SetCookies(u, []*http.Cookie{
-			{Name: "vid", Value: persistedCookie},
-		})
+		c.setCookie(apiBase, "vid", persistedCookie)
 		c.authed = true
 		slog.Debug("verisure: restored session from store")
 	}
@@ -76,14 +87,20 @@ func (c *Client) SubmitMFACode(code string) {
 	select {
 	case c.mfaCh <- code:
 	default:
-		// Already have a code queued (shouldn't happen in normal use).
 	}
 }
 
 // SessionCookie returns the current "vid" cookie value for persistence.
 func (c *Client) SessionCookie() string {
-	u, _ := url.Parse(c.baseURL)
+	u, _ := url.Parse(c.apiBase)
 	for _, cookie := range c.jar.Cookies(u) {
+		if cookie.Name == "vid" {
+			return cookie.Value
+		}
+	}
+	// Also check the verisure.com domain.
+	u2, _ := url.Parse("https://www.verisure.com")
+	for _, cookie := range c.jar.Cookies(u2) {
 		if cookie.Name == "vid" {
 			return cookie.Value
 		}
@@ -104,7 +121,7 @@ func (c *Client) ArmState(ctx context.Context) (ArmState, error) {
 
 	state, err := c.fetchArmStateLocked(ctx)
 	if err != nil {
-		// On auth error, invalidate session and try once more.
+		// On auth error, invalidate session and retry once.
 		c.authed = false
 		if loginErr := c.loginLocked(ctx); loginErr != nil {
 			return ArmStateUnknown, fmt.Errorf("verisure re-login: %w", loginErr)
@@ -122,30 +139,72 @@ func (c *Client) fetchArmStateLocked(ctx context.Context) (ArmState, error) {
 	return resp.Data.State, nil
 }
 
-// loginLocked performs the full login flow (must be called with c.mu held).
+// loginLocked performs the full login flow. Must be called with c.mu held.
+// Tries automation01 first, falls back to automation02.
 func (c *Client) loginLocked(ctx context.Context) error {
 	slog.Info("verisure: logging in", "email", c.email)
 
-	// Step 1: POST /cookie with credentials.
-	if err := c.postJSON(ctx, "/cookie", loginRequest{
-		Login:    c.email,
-		Password: c.password,
-	}, nil); err != nil {
-		return fmt.Errorf("POST /cookie: %w", err)
+	var lastErr error
+	for _, loginBase := range []string{defaultLoginBase, fallbackLoginBase} {
+		if err := c.tryLoginLocked(ctx, loginBase); err != nil {
+			slog.Debug("verisure: login attempt failed", "base", loginBase, "err", err)
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+// tryLoginLocked attempts the full auth flow against one login base URL.
+func (c *Client) tryLoginLocked(ctx context.Context, loginBase string) error {
+	// Step 1: Basic-auth POST to /auth/login.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, loginBase+"/auth/login", http.NoBody)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(c.email, c.password)
+	req.Header.Set("APPLICATION_ID", applicationID)
+	req.Header.Set("Accept", "application/json")
+	req.ContentLength = 0
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST /auth/login: %w", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("POST /auth/login: HTTP %d: %s", resp.StatusCode, body)
 	}
 
-	// Step 2: Check if MFA is required by probing /installation.
-	// If we get 401/403, MFA step is needed.
+	// Propagate the cookies the login server set to our API base domain.
+	c.propagateCookies(loginBase, resp.Cookies())
+
+	// If the response contains stepUpToken, MFA is required.
+	if strings.Contains(string(body), "stepUpToken") {
+		// Extract the vs-stepup cookie.
+		for _, cookie := range resp.Cookies() {
+			if cookie.Name == "vs-stepup" {
+				c.stepupCookie = cookie.Value
+			}
+		}
+		if c.stepupCookie == "" {
+			return fmt.Errorf("MFA required but no vs-stepup cookie in login response")
+		}
+		slog.Info("verisure: MFA required, triggering SMS")
+		if err := c.mfaFlowLocked(ctx, loginBase); err != nil {
+			return fmt.Errorf("MFA flow: %w", err)
+		}
+	} else {
+		// No MFA: vid cookie should already be in the jar.
+		slog.Info("verisure: login succeeded (no MFA)")
+	}
+
+	// Step 2: Discover installation GIID.
 	if err := c.discoverGIIDLocked(ctx); err != nil {
-		// Try MFA flow if we haven't got a GIID yet.
-		slog.Info("verisure: MFA required, requesting SMS code")
-		if mfaErr := c.mfaFlowLocked(ctx); mfaErr != nil {
-			return fmt.Errorf("MFA flow: %w", mfaErr)
-		}
-		// Retry GIID discovery after MFA.
-		if err := c.discoverGIIDLocked(ctx); err != nil {
-			return fmt.Errorf("GIID discovery after MFA: %w", err)
-		}
+		return fmt.Errorf("installation discovery: %w", err)
 	}
 
 	c.authed = true
@@ -153,22 +212,38 @@ func (c *Client) loginLocked(ctx context.Context) error {
 	return nil
 }
 
-// mfaFlowLocked triggers SMS and blocks until a code arrives via SubmitMFACode.
-func (c *Client) mfaFlowLocked(ctx context.Context) error {
-	// Drain any stale code.
+// mfaFlowLocked sends SMS, waits for the code, and validates it.
+func (c *Client) mfaFlowLocked(ctx context.Context, loginBase string) error {
+	// Drain stale code.
 	select {
 	case <-c.mfaCh:
 	default:
 	}
 
-	// POST /mfa to trigger SMS to registered phone.
-	if err := c.postJSON(ctx, "/mfa", mfaRequest{CallMe: false}, nil); err != nil {
-		return fmt.Errorf("trigger SMS: %w", err)
+	// Trigger SMS.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, loginBase+"/auth/mfa", http.NoBody)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("APPLICATION_ID", applicationID)
+	req.Header.Set("Accept", "application/json")
+	req.AddCookie(&http.Cookie{Name: "vs-stepup", Value: c.stepupCookie})
+	req.ContentLength = 0
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST /auth/mfa: %w", err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("POST /auth/mfa: HTTP %d", resp.StatusCode)
 	}
 
-	slog.Warn("verisure: SMS code sent — POST the code to /mfa-code to continue")
+	slog.Warn("verisure: SMS code sent — POST the code to /mfa-code to continue",
+		"phone", c.phone)
 
-	// Wait for operator to submit the code (via HTTP endpoint).
+	// Wait for code.
 	var code string
 	select {
 	case code = <-c.mfaCh:
@@ -176,22 +251,43 @@ func (c *Client) mfaFlowLocked(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	// Submit the code.
-	if err := c.postJSON(ctx, "/mfa/code", mfaCodeRequest{Token: code}, nil); err != nil {
-		return fmt.Errorf("submit MFA code: %w", err)
+	// Validate code: POST /auth/mfa/validate with JSON {"code": "XXXXXX"}.
+	payload, _ := json.Marshal(mfaValidateRequest{Code: code})
+	req2, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		loginBase+"/auth/mfa/validate", bytes.NewReader(payload))
+	if err != nil {
+		return err
 	}
+	req2.Header.Set("APPLICATION_ID", applicationID)
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Accept", "application/json")
+	req2.AddCookie(&http.Cookie{Name: "vs-stepup", Value: c.stepupCookie})
+
+	resp2, err := c.http.Do(req2)
+	if err != nil {
+		return fmt.Errorf("POST /auth/mfa/validate: %w", err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		return fmt.Errorf("POST /auth/mfa/validate: HTTP %d: %s", resp2.StatusCode, body2)
+	}
+
+	// Propagate vid cookie from MFA validation response to API domain.
+	c.propagateCookies(loginBase, resp2.Cookies())
 
 	slog.Info("verisure: MFA code accepted")
 	return nil
 }
 
-// discoverGIIDLocked fetches the installation list and sets c.giid if not already set.
+// discoverGIIDLocked fetches the installation list and populates c.giid.
 func (c *Client) discoverGIIDLocked(ctx context.Context) error {
 	if c.giid != "" {
 		return nil
 	}
+	path := "/installation/search?email=" + url.QueryEscape(c.email)
 	var installations installationsResponse
-	if err := c.get(ctx, "/installation", &installations); err != nil {
+	if err := c.get(ctx, path, &installations); err != nil {
 		return err
 	}
 	if len(installations) == 0 {
@@ -209,12 +305,15 @@ func (c *Client) SetGIID(giid string) {
 	c.mu.Unlock()
 }
 
+// --- HTTP helpers ---
+
 // get performs an authenticated GET and decodes the JSON response.
 func (c *Client) get(ctx context.Context, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.apiBase+path, nil)
 	if err != nil {
 		return err
 	}
+	req.Header.Set("APPLICATION_ID", applicationID)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
@@ -236,34 +335,27 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-// postJSON performs a POST with a JSON body, optionally decoding the response.
-func (c *Client) postJSON(ctx context.Context, path string, body, out any) error {
-	b, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+// setCookie injects a named cookie into the jar for the given base URL domain.
+func (c *Client) setCookie(base, name, value string) {
+	u, _ := url.Parse(base)
+	c.jar.SetCookies(u, []*http.Cookie{{Name: name, Value: value}})
+}
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
+// propagateCookies copies cookies received from the login server into the
+// jar under both the login domain and the API base domain so that subsequent
+// API calls include the vid cookie.
+func (c *Client) propagateCookies(loginBase string, cookies []*http.Cookie) {
+	loginURL, _ := url.Parse(loginBase)
+	apiURL, _ := url.Parse(c.apiBase)
 
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
-	}
-	if out == nil {
-		return nil
-	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	// Set on login domain (the jar already does this via the HTTP client,
+	// but we do it explicitly for the cookies we explicitly AddCookie'd).
+	c.jar.SetCookies(loginURL, cookies)
+
+	// Also set on the API base domain so API calls carry the vid.
+	c.jar.SetCookies(apiURL, cookies)
+
+	// And on the top-level verisure.com domain.
+	verisureURL, _ := url.Parse("https://www.verisure.com")
+	c.jar.SetCookies(verisureURL, cookies)
 }
