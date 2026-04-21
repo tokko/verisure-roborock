@@ -140,69 +140,83 @@ func (c *Client) fetchArmStateLocked(ctx context.Context) (ArmState, error) {
 }
 
 // loginLocked performs the full login flow. Must be called with c.mu held.
-// Tries automation01 first, falls back to automation02.
+// Tries automation01 first; falls back to automation02 only if the initial
+// POST /auth/login itself fails. Once a stepUpToken is received we commit
+// to that base URL — never fall back mid-MFA (which would trigger a second SMS).
 func (c *Client) loginLocked(ctx context.Context) error {
 	slog.Info("verisure: logging in", "email", c.email)
 
+	// Phase 1: POST /auth/login on each base until one accepts our credentials.
+	type loginResult struct {
+		base    string
+		stepup  string // non-empty means MFA required
+		cookies []*http.Cookie
+	}
+
+	var result *loginResult
 	var lastErr error
-	for _, loginBase := range []string{defaultLoginBase, fallbackLoginBase} {
-		if err := c.tryLoginLocked(ctx, loginBase); err != nil {
-			slog.Debug("verisure: login attempt failed", "base", loginBase, "err", err)
+
+	for _, base := range []string{defaultLoginBase, fallbackLoginBase} {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/auth/login", http.NoBody)
+		if err != nil {
 			lastErr = err
 			continue
 		}
-		return nil
-	}
-	return lastErr
-}
+		req.SetBasicAuth(c.email, c.password)
+		req.Header.Set("APPLICATION_ID", applicationID)
+		req.Header.Set("Accept", "application/json")
+		req.ContentLength = 0
 
-// tryLoginLocked attempts the full auth flow against one login base URL.
-func (c *Client) tryLoginLocked(ctx context.Context, loginBase string) error {
-	// Step 1: Basic-auth POST to /auth/login.
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, loginBase+"/auth/login", http.NoBody)
-	if err != nil {
-		return err
-	}
-	req.SetBasicAuth(c.email, c.password)
-	req.Header.Set("APPLICATION_ID", applicationID)
-	req.Header.Set("Accept", "application/json")
-	req.ContentLength = 0
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("POST %s/auth/login: %w", base, err)
+			slog.Debug("verisure: login base failed", "base", base, "err", lastErr)
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("POST /auth/login: %w", err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("POST /auth/login: HTTP %d: %s", resp.StatusCode, body)
+			slog.Debug("verisure: login base rejected", "base", base, "status", resp.StatusCode)
+			continue
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("POST /auth/login: HTTP %d: %s", resp.StatusCode, body)
-	}
-
-	// Propagate the cookies the login server set to our API base domain.
-	c.propagateCookies(loginBase, resp.Cookies())
-
-	// If the response contains stepUpToken, MFA is required.
-	if strings.Contains(string(body), "stepUpToken") {
-		// Extract the vs-stepup cookie.
-		for _, cookie := range resp.Cookies() {
-			if cookie.Name == "vs-stepup" {
-				c.stepupCookie = cookie.Value
+		r := &loginResult{base: base, cookies: resp.Cookies()}
+		if strings.Contains(string(body), "stepUpToken") {
+			for _, cookie := range resp.Cookies() {
+				if cookie.Name == "vs-stepup" {
+					r.stepup = cookie.Value
+				}
+			}
+			if r.stepup == "" {
+				lastErr = fmt.Errorf("MFA required but no vs-stepup cookie from %s", base)
+				continue
 			}
 		}
-		if c.stepupCookie == "" {
-			return fmt.Errorf("MFA required but no vs-stepup cookie in login response")
-		}
+		result = r
+		break
+	}
+
+	if result == nil {
+		return lastErr
+	}
+
+	// Propagate cookies to the API domain.
+	c.propagateCookies(result.base, result.cookies)
+
+	// Phase 2: complete MFA on the same base (no fallback — avoids double SMS).
+	if result.stepup != "" {
+		c.stepupCookie = result.stepup
 		slog.Info("verisure: MFA required, triggering SMS")
-		if err := c.mfaFlowLocked(ctx, loginBase); err != nil {
+		if err := c.mfaFlowLocked(ctx, result.base); err != nil {
 			return fmt.Errorf("MFA flow: %w", err)
 		}
 	} else {
-		// No MFA: vid cookie should already be in the jar.
 		slog.Info("verisure: login succeeded (no MFA)")
 	}
 
-	// Step 2: Discover installation GIID.
+	// Phase 3: discover installation GIID.
 	if err := c.discoverGIIDLocked(ctx); err != nil {
 		return fmt.Errorf("installation discovery: %w", err)
 	}

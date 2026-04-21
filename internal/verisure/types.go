@@ -21,7 +21,8 @@ func (a ArmState) IsDisengaged() bool {
 
 // mfaValidateRequest submits the SMS code to /auth/mfa/validate.
 type mfaValidateRequest struct {
-	Code string `json:"code"`
+	Code  string `json:"code"`
+	Trust bool   `json:"trust"` // false = don't persist trust on this device
 }
 
 // installationsResponse is the response from GET /installation.
