@@ -5,6 +5,7 @@ package roborock
 
 import (
 	"context"
+	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -40,6 +41,7 @@ type CloudDevice struct {
 type CloudClient struct {
 	baseURL  string
 	username string
+	clientID string // header_clientid: base64(md5(username)), required by Roborock API
 	http     *http.Client
 
 	rruid string
@@ -58,9 +60,14 @@ func NewCloudClient(username, region string) (*CloudClient, error) {
 		// Country codes in the EU zone map to "eu".
 		base = roborockRegions["eu"]
 	}
+	// header_clientid = base64(md5(username)) — required by the Roborock API.
+	h := md5.Sum([]byte(username))
+	cid := base64.StdEncoding.EncodeToString(h[:])
+
 	return &CloudClient{
 		baseURL:  base,
 		username: username,
+		clientID: cid,
 		http:     &http.Client{Timeout: 30 * time.Second},
 	}, nil
 }
@@ -76,7 +83,7 @@ func (c *CloudClient) RequestEmailCode(ctx context.Context) (string, error) {
 	if err := c.postForm(ctx, "/api/v1/sendEmailCode", url.Values{
 		"username": {c.username},
 		"type":     {"auth"},
-	}, &resp); err != nil {
+	}, &resp, c.clientID); err != nil {
 		return "", err
 	}
 	if resp.Code != 200 {
@@ -97,11 +104,11 @@ func (c *CloudClient) LoginWithCode(ctx context.Context, code string) error {
 		Msg string `json:"msg"`
 	}
 
-	if err := c.postForm(ctx, "/api/v1/login/email", url.Values{
+	if err := c.postForm(ctx, "/api/v1/loginWithCode", url.Values{
 		"username":       {c.username},
 		"verifycode":     {strings.TrimSpace(code)},
 		"verifycodetype": {"AUTH_EMAIL_CODE"},
-	}, &resp); err != nil {
+	}, &resp, c.clientID); err != nil {
 		return err
 	}
 
@@ -165,8 +172,8 @@ func (c *CloudClient) Devices(ctx context.Context) ([]CloudDevice, error) {
 }
 
 // postForm sends a POST with application/x-www-form-urlencoded body.
-// The Roborock API uses form encoding, not JSON, for auth endpoints.
-func (c *CloudClient) postForm(ctx context.Context, path string, form url.Values, out any) error {
+// clientID is set as the header_clientid header required by the Roborock API.
+func (c *CloudClient) postForm(ctx context.Context, path string, form url.Values, out any, clientID string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL+path, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -174,6 +181,9 @@ func (c *CloudClient) postForm(ctx context.Context, path string, form url.Values
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
+	if clientID != "" {
+		req.Header.Set("header_clientid", clientID)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
