@@ -66,11 +66,23 @@ func NewCloudClient(username, region string) (*CloudClient, error) {
 }
 
 // RequestEmailCode triggers a verification code to be sent to the user's email.
-func (c *CloudClient) RequestEmailCode(ctx context.Context) error {
-	return c.post(ctx, "/api/v1/sendEmailCode", map[string]string{
+// Returns the raw API response message so the caller can surface it for debugging.
+func (c *CloudClient) RequestEmailCode(ctx context.Context) (string, error) {
+	var resp struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data any    `json:"data"`
+	}
+	if err := c.post(ctx, "/api/v1/sendEmailCode", map[string]string{
 		"username": c.username,
 		"type":     "auth",
-	}, nil)
+	}, &resp); err != nil {
+		return "", err
+	}
+	if resp.Code != 200 {
+		return resp.Msg, fmt.Errorf("send code error %d: %s", resp.Code, resp.Msg)
+	}
+	return resp.Msg, nil
 }
 
 // LoginWithCode authenticates using the code received by email.

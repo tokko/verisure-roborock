@@ -79,11 +79,15 @@ func fetchViaRoborock(ctx context.Context, email, region string) ([]tokenDevice,
 	}
 
 	fmt.Fprintf(os.Stderr, "Sending verification code to %s...\n", email)
-	if err := client.RequestEmailCode(ctx); err != nil {
+	msg, err := client.RequestEmailCode(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("send code: %w", err)
 	}
+	if msg != "" {
+		fmt.Fprintf(os.Stderr, "API response: %s\n", msg)
+	}
 
-	fmt.Fprint(os.Stderr, "Enter the code from your email: ")
+	fmt.Fprint(os.Stderr, "Enter the code from your email (check spam too): ")
 	code := readLine()
 	if code == "" {
 		return nil, fmt.Errorf("no code entered")
