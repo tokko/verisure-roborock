@@ -1,6 +1,13 @@
-// Command fetch-tokens logs into the Xiaomi cloud using your Mi Home / Roborock
-// account credentials and prints the local miIO token for each Roborock device
-// found on your account. Copy the output directly into your .env file.
+// Command fetch-tokens discovers your Roborock vacuum IPs and local tokens.
+//
+// It tries two cloud backends in order:
+//  1. Roborock cloud (euiot.roborock.com) — for accounts created in the Roborock app
+//  2. Xiaomi / Mi Home cloud              — for accounts created in the Mi Home app
+//
+// The Roborock cloud flow sends a one-time code to your email.
+// The Xiaomi cloud flow uses your password directly.
+//
+// Output is ready to paste into .env.
 //
 // Usage:
 //
@@ -10,6 +17,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log/slog"
@@ -18,112 +26,197 @@ import (
 	"time"
 
 	"verisure-roborock/internal/config"
+	"verisure-roborock/internal/roborock"
 	"verisure-roborock/internal/xiaomi"
 )
 
 func main() {
 	config.LoadDotEnv(".env")
 
-	email := os.Getenv("XIAOMI_EMAIL")
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	email := firstNonEmpty(os.Getenv("XIAOMI_EMAIL"), os.Getenv("VERISURE_EMAIL"))
+	password := firstNonEmpty(os.Getenv("XIAOMI_PASSWORD"), os.Getenv("VERISURE_PASSWORD"))
+	country := firstNonEmpty(os.Getenv("XIAOMI_COUNTRY"), "de")
+
 	if email == "" {
-		email = os.Getenv("VERISURE_EMAIL")
-	}
-	password := os.Getenv("XIAOMI_PASSWORD")
-	if password == "" {
-		password = os.Getenv("VERISURE_PASSWORD")
-	}
-	country := os.Getenv("XIAOMI_COUNTRY")
-	if country == "" {
-		country = "de" // EU default
+		die("set VERISURE_EMAIL (or XIAOMI_EMAIL) in .env")
 	}
 
-	if email == "" || password == "" {
-		fmt.Fprintln(os.Stderr, "error: set XIAOMI_EMAIL and XIAOMI_PASSWORD (or VERISURE_EMAIL / VERISURE_PASSWORD) in .env")
-		os.Exit(1)
-	}
-
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	slog.Info("logging into Xiaomi cloud", "email", email, "country", country)
+	// Try Roborock cloud first — this is what the Roborock app uses.
+	devices, err := fetchViaRoborock(ctx, email, country)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nRoborock cloud failed: %v\n", err)
+		fmt.Fprintln(os.Stderr, "Trying Xiaomi / Mi Home cloud instead...")
+		fmt.Fprintln(os.Stderr, "")
 
+		if password == "" {
+			die("set VERISURE_PASSWORD (or XIAOMI_PASSWORD) in .env for Xiaomi cloud login")
+		}
+		devices, err = fetchViaXiaomi(ctx, email, password, country)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\nXiaomi cloud also failed: %v\n", err)
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "Troubleshooting:")
+			fmt.Fprintln(os.Stderr, "  - Roborock app users: check your email for the verification code")
+			fmt.Fprintln(os.Stderr, "  - Mi Home app users:  verify VERISURE_PASSWORD / XIAOMI_PASSWORD")
+			fmt.Fprintln(os.Stderr, "  - Non-EU accounts:    set XIAOMI_COUNTRY=us or sg")
+			os.Exit(1)
+		}
+	}
+
+	printEnv(devices)
+}
+
+// fetchViaRoborock authenticates via euiot.roborock.com using an email OTP.
+func fetchViaRoborock(ctx context.Context, email, region string) ([]tokenDevice, error) {
+	client, err := roborock.NewCloudClient(email, region)
+	if err != nil {
+		return nil, err
+	}
+
+	fmt.Fprintf(os.Stderr, "Sending verification code to %s...\n", email)
+	if err := client.RequestEmailCode(ctx); err != nil {
+		return nil, fmt.Errorf("send code: %w", err)
+	}
+
+	fmt.Fprint(os.Stderr, "Enter the code from your email: ")
+	code := readLine()
+	if code == "" {
+		return nil, fmt.Errorf("no code entered")
+	}
+
+	if err := client.LoginWithCode(ctx, code); err != nil {
+		return nil, fmt.Errorf("login: %w", err)
+	}
+	fmt.Fprintln(os.Stderr, "Authenticated. Fetching devices...")
+
+	cloudDevices, err := client.Devices(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("device list: %w", err)
+	}
+
+	var out []tokenDevice
+	for _, d := range cloudDevices {
+		ip := ""
+		if d.NetworkInfo != nil {
+			ip = d.NetworkInfo.LocalIP
+		}
+		out = append(out, tokenDevice{
+			Name:  d.Name,
+			IP:    ip,
+			Token: d.LocalKey,
+		})
+	}
+	return out, nil
+}
+
+// fetchViaXiaomi authenticates via Xiaomi account.xiaomi.com (Mi Home accounts).
+func fetchViaXiaomi(ctx context.Context, email, password, country string) ([]tokenDevice, error) {
 	client, err := xiaomi.NewCloudClient(email, password, country)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return nil, err
 	}
-
+	fmt.Fprintf(os.Stderr, "Logging into Xiaomi cloud (%s)...\n", country)
 	if err := client.Login(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "login failed: %v\n", err)
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Troubleshooting:")
-		fmt.Fprintln(os.Stderr, "  - Check XIAOMI_EMAIL and XIAOMI_PASSWORD in your .env")
-		fmt.Fprintln(os.Stderr, "  - For non-EU accounts, set XIAOMI_COUNTRY=us (or sg, cn, ru, tw, i2)")
-		fmt.Fprintln(os.Stderr, "  - Xiaomi may require a captcha after repeated failures — wait a few minutes")
-		os.Exit(1)
+		return nil, err
 	}
+	fmt.Fprintln(os.Stderr, "Fetching devices...")
 
-	slog.Info("fetching device list...")
 	devices, err := client.Devices(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "device list failed: %v\n", err)
-		os.Exit(1)
+		return nil, err
 	}
 
-	// Filter to Roborock vacuums.
-	var robots []xiaomi.Device
+	var out []tokenDevice
 	for _, d := range devices {
-		if d.IsRoborock() {
-			robots = append(robots, d)
+		if !d.IsRoborock() {
+			continue
 		}
+		out = append(out, tokenDevice{
+			Name:  d.Name,
+			IP:    d.LocalIP,
+			Token: d.Token,
+		})
 	}
+	return out, nil
+}
 
-	if len(robots) == 0 {
+type tokenDevice struct {
+	Name  string
+	IP    string
+	Token string
+}
+
+func printEnv(devices []tokenDevice) {
+	if len(devices) == 0 {
 		fmt.Fprintln(os.Stderr, "no Roborock devices found on this account")
-		fmt.Fprintf(os.Stderr, "found %d total devices:\n", len(devices))
-		for _, d := range devices {
-			fmt.Fprintf(os.Stderr, "  %s (%s) @ %s\n", d.Name, d.Model, d.LocalIP)
-		}
 		os.Exit(1)
 	}
 
-	fmt.Println("# Paste the following into your .env file:")
-	fmt.Println("# (review IPs — they are only correct if the device is currently on your local network)")
+	fmt.Println("# Paste into your .env:")
+	fmt.Println("# (verify IPs — they are only accurate if devices are on your local network now)")
 	fmt.Println()
 
-	for i, d := range robots {
-		token := d.Token
-		if token == "" {
-			token = "<token not available — device may be owned by a different account>"
+	for i, d := range devices {
+		ip := d.IP
+		if ip == "" {
+			ip = "<check your router DHCP table>"
 		}
 		name := sanitizeName(d.Name)
-		fmt.Printf("ROBOROCK_%d_HOST=%s\n", i, d.LocalIP)
+		token := d.Token
+		if token == "" {
+			token = "<not available>"
+		}
+		fmt.Printf("ROBOROCK_%d_HOST=%s\n", i, ip)
 		fmt.Printf("ROBOROCK_%d_TOKEN=%s\n", i, token)
 		fmt.Printf("ROBOROCK_%d_NAME=%s\n", i, name)
-		if i < len(robots)-1 {
+		if i < len(devices)-1 {
 			fmt.Println()
 		}
 	}
 
 	fmt.Println()
-	fmt.Printf("# Found %d Roborock device(s)\n", len(robots))
-	if len(devices) > len(robots) {
-		fmt.Printf("# (%d other non-Roborock devices were skipped)\n", len(devices)-len(robots))
-	}
+	fmt.Fprintf(os.Stderr, "Found %d device(s)\n", len(devices))
 }
 
-// sanitizeName converts a device name into a safe env-value label.
 func sanitizeName(name string) string {
 	name = strings.ToLower(name)
 	name = strings.ReplaceAll(name, " ", "-")
-	// Keep only alphanumeric and hyphens.
 	var b strings.Builder
 	for _, r := range name {
-		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
 			b.WriteRune(r)
 		}
 	}
-	return b.String()
+	s := b.String()
+	if s == "" {
+		return "vacuum"
+	}
+	return s
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func readLine() string {
+	sc := bufio.NewScanner(os.Stdin)
+	if sc.Scan() {
+		return strings.TrimSpace(sc.Text())
+	}
+	return ""
+}
+
+func die(msg string) {
+	fmt.Fprintln(os.Stderr, "error:", msg)
+	os.Exit(1)
 }
