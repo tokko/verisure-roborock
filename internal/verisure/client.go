@@ -153,11 +153,23 @@ func (c *Client) ArmState(ctx context.Context) (ArmState, error) {
 		}
 	}
 
-	// GIID discovery is separate: a transient error here must not clear the
-	// MFA session and force another SMS.
+	// GIID discovery is separate from auth: a transient 503/network error must
+	// not clear the MFA session and force another SMS. But a 401/403 means the
+	// restored session cookie is invalid — clear authed and re-login immediately.
 	if c.giid == "" {
 		if err := c.discoverGIIDLocked(ctx); err != nil {
-			return ArmStateUnknown, fmt.Errorf("verisure installation discovery: %w", err)
+			if isSessionExpired(err) {
+				c.authed = false
+				c.giid = ""
+				if loginErr := c.loginLocked(ctx); loginErr != nil {
+					return ArmStateUnknown, fmt.Errorf("verisure re-login (expired cookie): %w", loginErr)
+				}
+				if discErr := c.discoverGIIDLocked(ctx); discErr != nil {
+					return ArmStateUnknown, fmt.Errorf("verisure installation discovery: %w", discErr)
+				}
+			} else {
+				return ArmStateUnknown, fmt.Errorf("verisure installation discovery: %w", err)
+			}
 		}
 	}
 
