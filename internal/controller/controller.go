@@ -80,19 +80,30 @@ func New(
 
 // Run reconciles state on startup then enters the poll loop.
 // It blocks until ctx is cancelled.
+//
+// The poll interval backs off exponentially on consecutive Verisure errors
+// (base = pollInterval, cap = 5 min) and resets on the next success.
+// This prevents hammering Verisure when they are rate-limiting or down.
 func (c *Controller) Run(ctx context.Context) error {
 	slog.Info("controller: starting")
 	c.reconcileOnStartup(ctx)
 
-	ticker := time.NewTicker(c.pollInterval)
-	defer ticker.Stop()
-
+	failures := 0
 	for {
+		wait := backoffDuration(failures, c.pollInterval, 5*time.Minute)
+		if failures > 0 {
+			slog.Debug("controller: poll back-off", "failures", failures, "wait", wait)
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
-			c.poll(ctx)
+		case <-time.After(wait):
+		}
+
+		if c.poll(ctx) {
+			failures = 0
+		} else {
+			failures++
 		}
 	}
 }
@@ -101,17 +112,16 @@ func (c *Controller) Run(ctx context.Context) error {
 func (c *Controller) State() ControlState { return c.state }
 
 // poll fetches the current alarm state and triggers transitions on change.
-func (c *Controller) poll(ctx context.Context) {
-	alarm, err := withRetry(ctx, 3, 5*time.Second, 5*time.Minute, func() (verisure.ArmState, error) {
-		return c.alarm.ArmState(ctx)
-	})
+// Returns true on success, false on error.
+func (c *Controller) poll(ctx context.Context) bool {
+	alarm, err := c.alarm.ArmState(ctx)
 	if err != nil {
 		slog.Warn("controller: poll failed", "err", err)
-		return
+		return false
 	}
 
 	if alarm == c.lastAlarm {
-		return
+		return true
 	}
 
 	slog.Info("controller: alarm state changed", "from", c.lastAlarm, "to", alarm)
@@ -125,6 +135,7 @@ func (c *Controller) poll(ctx context.Context) {
 	} else if alarm.IsDisengaged() {
 		c.onDisengaged(ctx)
 	}
+	return true
 }
 
 // onArmedAway iterates all vacuums and starts/resumes any that need cleaning.
