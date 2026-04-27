@@ -283,16 +283,24 @@ func (c *Controller) reconcileOnStartup(ctx context.Context) {
 	slog.Info("controller: reconciling state on startup")
 	st := c.store.Get()
 
-	// Fetch current alarm state (retry until success or ctx done).
+	// Fetch current alarm state (retry with backoff, give up after ~30 min so
+	// the poll loop can take over rather than blocking startup indefinitely).
+	const maxReconcileAttempts = 12
 	var alarm verisure.ArmState
 	var err error
-	for attempt := 0; ; attempt++ {
+	for attempt := 0; attempt < maxReconcileAttempts; attempt++ {
 		alarm, err = c.alarm.ArmState(ctx)
 		if err == nil {
 			break
 		}
+		if attempt == maxReconcileAttempts-1 {
+			slog.Warn("controller: reconcile giving up after too many failures, poll loop will correct state",
+				"attempts", maxReconcileAttempts)
+			return
+		}
 		wait := backoffDuration(attempt, 5*time.Second, 5*time.Minute)
-		slog.Warn("controller: reconcile alarm fetch failed", "err", err, "retry_in", wait)
+		slog.Warn("controller: reconcile alarm fetch failed", "err", err, "retry_in", wait,
+			"attempt", attempt+1, "max", maxReconcileAttempts)
 		select {
 		case <-ctx.Done():
 			return

@@ -70,9 +70,18 @@ func NewClient(apiBase, email, password, phone, persistedCookie string) (*Client
 		},
 	}
 	if persistedCookie != "" {
-		c.setCookie(apiBase, "vid", persistedCookie)
-		c.authed = true
-		slog.Debug("verisure: restored session from store")
+		// persistedCookie is stored as "cookieName=cookieValue" by SessionCookie().
+		// Split on the first "=" so we restore the cookie under the right name
+		// (e.g. "vs-access" or "vid"), not always under "vid".
+		if eq := strings.Index(persistedCookie, "="); eq > 0 {
+			name := persistedCookie[:eq]
+			value := persistedCookie[eq+1:]
+			c.setCookie(apiBase, name, value)
+			c.authed = true
+			slog.Debug("verisure: restored session from store", "cookie_name", name)
+		} else {
+			slog.Warn("verisure: ignoring malformed persisted cookie")
+		}
 	}
 	return c, nil
 }
