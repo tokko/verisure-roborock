@@ -407,16 +407,59 @@ type gqlBody struct {
 	Query         string         `json:"query"`
 }
 
-// graphql POSTs a GraphQL request array to the automation server and decodes the response into out.
+// otherBase returns the automation server that is NOT c.loginBase.
+func (c *Client) otherBase() string {
+	if c.loginBase == defaultLoginBase {
+		return fallbackLoginBase
+	}
+	return defaultLoginBase
+}
+
+// graphql POSTs a GraphQL request array to the automation server.
+// On SYS_00004 (backend unavailable) it retries on the other automation server,
+// mirroring the failover behaviour of the python-verisure library.
 func (c *Client) graphql(ctx context.Context, body []gqlBody, out any) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.loginBase+"/graphql", bytes.NewReader(data))
+
+	for _, base := range []string{c.loginBase, c.otherBase()} {
+		respBody, err := c.graphqlOnce(ctx, base, bytes.NewReader(data))
+		if err != nil {
+			return err // network / HTTP error, no point retrying the other base
+		}
+
+		// GraphQL errors are returned as 200 with an "errors" key.
+		if bytes.Contains(respBody, []byte(`"errors"`)) {
+			// SYS_00004 means this backend shard doesn't have the account;
+			// try the other automation server.
+			if bytes.Contains(respBody, []byte("SYS_00004")) {
+				slog.Debug("verisure: graphql SYS_00004, trying other base", "failed_base", base)
+				continue
+			}
+			return fmt.Errorf("graphql error: %s", respBody)
+		}
+
+		// Success — remember the working base for future calls.
+		if base != c.loginBase {
+			slog.Info("verisure: switching to fallback graphql base", "base", base)
+			c.loginBase = base
+		}
+		if out == nil {
+			return nil
+		}
+		return json.Unmarshal(respBody, out)
+	}
+
+	return fmt.Errorf("graphql: SYS_00004 on all automation servers")
+}
+
+func (c *Client) graphqlOnce(ctx context.Context, base string, body *bytes.Reader) ([]byte, error) {
+	body.Seek(0, 0) // rewind for retry
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/graphql", body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("APPLICATION_ID", applicationID)
 	req.Header.Set("Content-Type", "application/json")
@@ -424,27 +467,18 @@ func (c *Client) graphql(ctx context.Context, body []gqlBody, out any) error {
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("HTTP %d (session expired)", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP %d (session expired)", resp.StatusCode)
 	}
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, respBody)
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, respBody)
 	}
-
-	// GraphQL errors are returned as 200 with an "errors" key.
-	if bytes.Contains(respBody, []byte(`"errors"`)) {
-		return fmt.Errorf("graphql error: %s", respBody)
-	}
-
-	if out == nil {
-		return nil
-	}
-	return json.Unmarshal(respBody, out)
+	return respBody, nil
 }
 
 func (c *Client) setCookie(base, name, value string) {
