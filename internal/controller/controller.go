@@ -356,6 +356,10 @@ func (c *Controller) reconcileOnStartup(ctx context.Context) {
 		c.setState(StateIdle)
 	}
 
+	// Persist the initial alarm state so /status shows it immediately.
+	if err := c.store.SetAlarmState(string(alarm)); err != nil {
+		slog.Error("controller: persist alarm state on reconcile", "err", err)
+	}
 	slog.Info("controller: reconcile complete", "state", c.state, "alarm", alarm)
 }
 

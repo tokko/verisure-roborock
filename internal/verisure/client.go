@@ -388,7 +388,7 @@ func (c *Client) discoverGIIDLocked(ctx context.Context) error {
 		return fmt.Errorf("no installations found")
 	}
 	c.giid = resp.Data.Account.Installations[0].GIID
-	slog.Debug("verisure: discovered installation",
+	slog.Info("verisure: discovered installation",
 		"giid", c.giid,
 		"alias", resp.Data.Account.Installations[0].Alias)
 	return nil
