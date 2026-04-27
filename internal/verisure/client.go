@@ -102,21 +102,51 @@ func (c *Client) ArmState(ctx context.Context) (ArmState, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Login (including MFA) if not yet authenticated.
 	if !c.authed {
 		if err := c.loginLocked(ctx); err != nil {
 			return ArmStateUnknown, fmt.Errorf("verisure login: %w", err)
 		}
 	}
 
+	// GIID discovery is separate: a transient 503 here must not clear the
+	// MFA session and force another SMS.
+	if c.giid == "" {
+		if err := c.discoverGIIDLocked(ctx); err != nil {
+			return ArmStateUnknown, fmt.Errorf("verisure installation discovery: %w", err)
+		}
+	}
+
 	state, err := c.fetchArmStateLocked(ctx)
 	if err != nil {
-		c.authed = false
-		if loginErr := c.loginLocked(ctx); loginErr != nil {
-			return ArmStateUnknown, fmt.Errorf("verisure re-login: %w", loginErr)
+		// Only redo the full login on a genuine session-expiry error.
+		if isSessionExpired(err) {
+			c.authed = false
+			c.giid = ""
+			if loginErr := c.loginLocked(ctx); loginErr != nil {
+				return ArmStateUnknown, fmt.Errorf("verisure re-login: %w", loginErr)
+			}
+			if c.giid == "" {
+				if discErr := c.discoverGIIDLocked(ctx); discErr != nil {
+					return ArmStateUnknown, fmt.Errorf("verisure re-discovery: %w", discErr)
+				}
+			}
+			state, err = c.fetchArmStateLocked(ctx)
 		}
-		state, err = c.fetchArmStateLocked(ctx)
 	}
 	return state, err
+}
+
+// isSessionExpired returns true for HTTP 401/403 errors that indicate the
+// session cookie has expired — as opposed to transient server errors (503 etc.)
+// which should be retried without a full re-login.
+func isSessionExpired(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "HTTP 401") || strings.Contains(s, "HTTP 403") ||
+		strings.Contains(s, "session expired")
 }
 
 func (c *Client) fetchArmStateLocked(ctx context.Context) (ArmState, error) {
@@ -296,13 +326,12 @@ func (c *Client) validateMFALocked(ctx context.Context, state *mfaState) error {
 	return nil
 }
 
-// finishLoginLocked discovers the installation GIID and marks the client as authed.
+// finishLoginLocked marks the session as authenticated.
+// GIID discovery is intentionally deferred to ArmState so that a transient
+// 503 on the installation endpoint does not force a full re-login (new SMS).
 func (c *Client) finishLoginLocked(ctx context.Context) error {
-	if err := c.discoverGIIDLocked(ctx); err != nil {
-		return fmt.Errorf("installation discovery: %w", err)
-	}
 	c.authed = true
-	slog.Info("verisure: authenticated", "giid", c.giid)
+	slog.Info("verisure: session authenticated (GIID discovery deferred)")
 	return nil
 }
 
