@@ -26,19 +26,28 @@ type mfaValidateRequest struct {
 	Trust bool   `json:"trust"` // false = don't persist trust on this device
 }
 
-// installationsResponse is the response from GET /installation.
-type installationsResponse []struct {
-	GIID  string `json:"giid"`
-	Alias string `json:"alias"`
+// GraphQL response types for the automation01.verisure.com API.
+
+type graphQLInstallationsResponse struct {
+	Data struct {
+		Account struct {
+			Installations []struct {
+				GIID  string `json:"giid"`
+				Alias string `json:"alias"`
+			} `json:"installations"`
+		} `json:"account"`
+	} `json:"data"`
 }
 
-// armStateResponse is the response from GET /installation/{giid}/armstate.
-type armStateResponse struct {
+type graphQLArmStateResponse struct {
 	Data struct {
-		State      ArmState `json:"state"`
-		StatusType string   `json:"statusType"`
-		Date       string   `json:"date"`
-		Name       string   `json:"name"`
-		ChangedVia string   `json:"changedVia"`
+		Installation struct {
+			ArmState struct {
+				StatusType string `json:"statusType"`
+				Date       string `json:"date"`
+				Name       string `json:"name"`
+				ChangedVia string `json:"changedVia"`
+			} `json:"armState"`
+		} `json:"installation"`
 	} `json:"data"`
 }

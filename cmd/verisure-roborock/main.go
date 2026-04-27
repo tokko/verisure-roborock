@@ -52,7 +52,6 @@ func run() error {
 	// Build Verisure client, restoring session cookie from store if available.
 	persisted := st.Get()
 	verisureClient, err := verisure.NewClient(
-		cfg.VerisureBaseURL,
 		cfg.VerisureEmail,
 		cfg.VerisurePassword,
 		cfg.VerisureMFAPhone,

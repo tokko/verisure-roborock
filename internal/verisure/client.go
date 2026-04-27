@@ -20,6 +20,33 @@ const (
 	fallbackLoginBase = "https://automation02.verisure.com"
 )
 
+// GraphQL queries used by the Verisure version-2 API.
+const (
+	queryFetchInstallations = `query fetchAllInstallations($email: String!) {
+  account(email: $email) {
+    installations {
+      giid
+      alias
+      __typename
+    }
+    __typename
+  }
+}`
+
+	queryArmState = `query ArmState($giid: String!) {
+  installation(giid: $giid) {
+    armState {
+      statusType
+      date
+      name
+      changedVia
+      __typename
+    }
+    __typename
+  }
+}`
+)
+
 // mfaState tracks a pending MFA flow so we never send a second SMS
 // while still waiting for the user to submit the first code.
 type mfaState struct {
@@ -27,12 +54,14 @@ type mfaState struct {
 	stepupCookie string
 }
 
-// Client is a Verisure REST API client with session cookie management.
+// Client is a Verisure API client using the GraphQL endpoint on automation01.verisure.com.
 type Client struct {
-	apiBase  string
-	email    string
-	password string
-	phone    string
+	// loginBase is the automation server we authenticated against.
+	// Starts as defaultLoginBase; updated if the fallback succeeds.
+	loginBase string
+	email     string
+	password  string
+	phone     string
 
 	http *http.Client
 	jar  *cookiejar.Jar
@@ -50,18 +79,18 @@ type Client struct {
 	mfaCh chan string
 }
 
-func NewClient(apiBase, email, password, phone, persistedCookie string) (*Client, error) {
+func NewClient(email, password, phone, persistedCookie string) (*Client, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, err
 	}
 	c := &Client{
-		apiBase:  apiBase,
-		email:    email,
-		password: password,
-		phone:    phone,
-		jar:      jar,
-		mfaCh:    make(chan string, 1),
+		loginBase: defaultLoginBase,
+		email:     email,
+		password:  password,
+		phone:     phone,
+		jar:       jar,
+		mfaCh:     make(chan string, 1),
 	}
 	c.http = &http.Client{
 		Jar: jar,
@@ -71,12 +100,11 @@ func NewClient(apiBase, email, password, phone, persistedCookie string) (*Client
 	}
 	if persistedCookie != "" {
 		// persistedCookie is stored as "cookieName=cookieValue" by SessionCookie().
-		// Split on the first "=" so we restore the cookie under the right name
-		// (e.g. "vs-access" or "vid"), not always under "vid".
+		// Split on the first "=" so we restore the cookie under the right name.
 		if eq := strings.Index(persistedCookie, "="); eq > 0 {
 			name := persistedCookie[:eq]
 			value := persistedCookie[eq+1:]
-			c.setCookie(apiBase, name, value)
+			c.setCookieOnAll(name, value)
 			c.authed = true
 			slog.Debug("verisure: restored session from store", "cookie_name", name)
 		} else {
@@ -94,9 +122,7 @@ func (c *Client) SubmitMFACode(code string) {
 }
 
 func (c *Client) SessionCookie() string {
-	// The API now returns vs-access (JWT) instead of vid. Persist whichever
-	// session cookie we have so we can resume without re-authenticating.
-	for _, base := range []string{c.apiBase, "https://www.verisure.com"} {
+	for _, base := range []string{c.loginBase, defaultLoginBase, fallbackLoginBase} {
 		u, _ := url.Parse(base)
 		for _, cookie := range c.jar.Cookies(u) {
 			if cookie.Name == "vs-access" || cookie.Name == "vid" {
@@ -118,7 +144,7 @@ func (c *Client) ArmState(ctx context.Context) (ArmState, error) {
 		}
 	}
 
-	// GIID discovery is separate: a transient 503 here must not clear the
+	// GIID discovery is separate: a transient error here must not clear the
 	// MFA session and force another SMS.
 	if c.giid == "" {
 		if err := c.discoverGIIDLocked(ctx); err != nil {
@@ -146,9 +172,9 @@ func (c *Client) ArmState(ctx context.Context) (ArmState, error) {
 	return state, err
 }
 
-// isSessionExpired returns true for HTTP 401/403 errors that indicate the
-// session cookie has expired — as opposed to transient server errors (503 etc.)
-// which should be retried without a full re-login.
+// isSessionExpired returns true for HTTP 401/403 errors indicating the session
+// cookie has expired — as opposed to transient errors which should be retried
+// without a full re-login.
 func isSessionExpired(err error) bool {
 	if err == nil {
 		return false
@@ -159,11 +185,15 @@ func isSessionExpired(err error) bool {
 }
 
 func (c *Client) fetchArmStateLocked(ctx context.Context) (ArmState, error) {
-	var resp armStateResponse
-	if err := c.get(ctx, fmt.Sprintf("/installation/%s/armstate", c.giid), &resp); err != nil {
+	var resp graphQLArmStateResponse
+	if err := c.graphql(ctx, []gqlBody{{
+		OperationName: "ArmState",
+		Variables:     map[string]any{"giid": c.giid},
+		Query:         queryArmState,
+	}}, &resp); err != nil {
 		return ArmStateUnknown, err
 	}
-	return resp.Data.State, nil
+	return ArmState(resp.Data.Installation.ArmState.StatusType), nil
 }
 
 // loginLocked authenticates. If an MFA flow is already in progress
@@ -172,15 +202,14 @@ func (c *Client) loginLocked(ctx context.Context) error {
 	slog.Info("verisure: logging in", "email", c.email)
 
 	// If we're already mid-MFA (SMS was sent, waiting for code) skip
-	// the /auth/login POST and go straight to validate. This prevents
-	// sending a new SMS on every retry.
+	// the /auth/login POST and go straight to validate.
 	if c.pendingMFA != nil {
 		slog.Info("verisure: resuming pending MFA flow, waiting for SMS code")
 		if err := c.validateMFALocked(ctx, c.pendingMFA); err != nil {
-			// Bad/expired code — clear state so next attempt restarts the flow.
 			c.pendingMFA = nil
 			return fmt.Errorf("MFA validate: %w", err)
 		}
+		c.loginBase = c.pendingMFA.loginBase
 		c.pendingMFA = nil
 		return c.finishLoginLocked(ctx)
 	}
@@ -231,8 +260,9 @@ func (c *Client) loginLocked(ctx context.Context) error {
 			}
 			pending = &mfaState{loginBase: base, stepupCookie: stepup}
 		} else {
-			// No MFA: vid cookie is already in the jar.
+			// No MFA: session cookies already in the jar.
 			slog.Info("verisure: login succeeded (no MFA)")
+			c.loginBase = base
 		}
 		lastErr = nil
 		break
@@ -252,14 +282,12 @@ func (c *Client) loginLocked(ctx context.Context) error {
 		c.pendingMFA = pending
 
 		if err := c.validateMFALocked(ctx, pending); err != nil {
-			// Code wrong or expired; pendingMFA stays set so next retry
-			// asks for a new code (without sending another SMS).
-			// But if the error suggests the session is dead, clear it.
 			if strings.Contains(err.Error(), "HTTP 4") {
 				c.pendingMFA = nil
 			}
 			return fmt.Errorf("MFA validate: %w", err)
 		}
+		c.loginBase = pending.loginBase
 		c.pendingMFA = nil
 	}
 
@@ -337,7 +365,7 @@ func (c *Client) validateMFALocked(ctx context.Context, state *mfaState) error {
 
 // finishLoginLocked marks the session as authenticated.
 // GIID discovery is intentionally deferred to ArmState so that a transient
-// 503 on the installation endpoint does not force a full re-login (new SMS).
+// error on the installation endpoint does not force a full re-login (new SMS).
 func (c *Client) finishLoginLocked(ctx context.Context) error {
 	c.authed = true
 	slog.Info("verisure: session authenticated (GIID discovery deferred)")
@@ -348,16 +376,21 @@ func (c *Client) discoverGIIDLocked(ctx context.Context) error {
 	if c.giid != "" {
 		return nil
 	}
-	path := "/installation/search?email=" + url.QueryEscape(c.email)
-	var installations installationsResponse
-	if err := c.get(ctx, path, &installations); err != nil {
+	var resp graphQLInstallationsResponse
+	if err := c.graphql(ctx, []gqlBody{{
+		OperationName: "fetchAllInstallations",
+		Variables:     map[string]any{"email": c.email},
+		Query:         queryFetchInstallations,
+	}}, &resp); err != nil {
 		return err
 	}
-	if len(installations) == 0 {
+	if len(resp.Data.Account.Installations) == 0 {
 		return fmt.Errorf("no installations found")
 	}
-	c.giid = installations[0].GIID
-	slog.Debug("verisure: discovered installation", "giid", c.giid, "alias", installations[0].Alias)
+	c.giid = resp.Data.Account.Installations[0].GIID
+	slog.Debug("verisure: discovered installation",
+		"giid", c.giid,
+		"alias", resp.Data.Account.Installations[0].Alias)
 	return nil
 }
 
@@ -367,12 +400,26 @@ func (c *Client) SetGIID(giid string) {
 	c.mu.Unlock()
 }
 
-func (c *Client) get(ctx context.Context, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.apiBase+path, nil)
+// gqlBody is a single GraphQL operation sent as part of a JSON array.
+type gqlBody struct {
+	OperationName string         `json:"operationName"`
+	Variables     map[string]any `json:"variables"`
+	Query         string         `json:"query"`
+}
+
+// graphql POSTs a GraphQL request array to the automation server and decodes the response into out.
+func (c *Client) graphql(ctx context.Context, body []gqlBody, out any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.loginBase+"/graphql", bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("APPLICATION_ID", applicationID)
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
@@ -380,18 +427,24 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 		return err
 	}
 	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return fmt.Errorf("HTTP %d (session expired)", resp.StatusCode)
 	}
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, respBody)
 	}
+
+	// GraphQL errors are returned as 200 with an "errors" key.
+	if bytes.Contains(respBody, []byte(`"errors"`)) {
+		return fmt.Errorf("graphql error: %s", respBody)
+	}
+
 	if out == nil {
 		return nil
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return json.Unmarshal(respBody, out)
 }
 
 func (c *Client) setCookie(base, name, value string) {
@@ -399,8 +452,15 @@ func (c *Client) setCookie(base, name, value string) {
 	c.jar.SetCookies(u, []*http.Cookie{{Name: name, Value: value}})
 }
 
+// setCookieOnAll sets a cookie on both automation servers and www.verisure.com.
+func (c *Client) setCookieOnAll(name, value string) {
+	for _, base := range []string{defaultLoginBase, fallbackLoginBase, "https://www.verisure.com"} {
+		c.setCookie(base, name, value)
+	}
+}
+
 func (c *Client) propagateCookies(loginBase string, cookies []*http.Cookie) {
-	for _, base := range []string{loginBase, c.apiBase, "https://www.verisure.com"} {
+	for _, base := range []string{loginBase, defaultLoginBase, fallbackLoginBase, "https://www.verisure.com"} {
 		u, _ := url.Parse(base)
 		c.jar.SetCookies(u, cookies)
 	}
