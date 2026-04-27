@@ -122,12 +122,21 @@ func (c *Client) SubmitMFACode(code string) {
 }
 
 func (c *Client) SessionCookie() string {
+	// vs-access (JWT) is preferred over the legacy vid cookie.
+	// "no_vid_cookie" is a Verisure placeholder set before MFA — skip it.
 	for _, base := range []string{c.loginBase, defaultLoginBase, fallbackLoginBase} {
 		u, _ := url.Parse(base)
+		var vidValue string
 		for _, cookie := range c.jar.Cookies(u) {
-			if cookie.Name == "vs-access" || cookie.Name == "vid" {
-				return cookie.Name + "=" + cookie.Value
+			if cookie.Name == "vs-access" && cookie.Value != "" {
+				return "vs-access=" + cookie.Value
 			}
+			if cookie.Name == "vid" && cookie.Value != "" && cookie.Value != "no_vid_cookie" {
+				vidValue = cookie.Value
+			}
+		}
+		if vidValue != "" {
+			return "vid=" + vidValue
 		}
 	}
 	return ""
@@ -494,8 +503,23 @@ func (c *Client) setCookieOnAll(name, value string) {
 }
 
 func (c *Client) propagateCookies(loginBase string, cookies []*http.Cookie) {
-	for _, base := range []string{loginBase, defaultLoginBase, fallbackLoginBase, "https://www.verisure.com"} {
+	// Set on the origin host with the original cookie attributes.
+	orig, _ := url.Parse(loginBase)
+	c.jar.SetCookies(orig, cookies)
+
+	// For other hosts, strip the Domain attribute so Go's cookiejar accepts
+	// them regardless of which automation server issued them.
+	stripped := make([]*http.Cookie, len(cookies))
+	for i, ck := range cookies {
+		cp := *ck
+		cp.Domain = ""
+		stripped[i] = &cp
+	}
+	for _, base := range []string{defaultLoginBase, fallbackLoginBase, "https://www.verisure.com"} {
+		if base == loginBase {
+			continue
+		}
 		u, _ := url.Parse(base)
-		c.jar.SetCookies(u, cookies)
+		c.jar.SetCookies(u, stripped)
 	}
 }
