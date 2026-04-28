@@ -126,37 +126,44 @@ func (c *Client) SubmitMFACode(code string) {
 }
 
 func (c *Client) SessionCookie() string {
-	// Collect vs-access (JWT) and vs-trust (long-lived trust token).
-	// "no_vid_cookie" is a Verisure placeholder set before MFA — skip it.
-	var access, trust, vid string
+	// Collect session cookies to persist across restarts.
+	// - vs-access: short-lived JWT (10 min) — worth saving so startup
+	//   works immediately if restarted within the window.
+	// - vs-trust-<hash>: long-lived trust token issued by /auth/trust.
+	//   The name has an account-specific hash suffix; we match by prefix.
+	//   With this cookie in the jar, POST /auth/login returns a fresh
+	//   vs-access without triggering MFA again.
+	// - vs-refresh: refresh token at Path=/auth — save for completeness.
+	// - vid: legacy session cookie, kept as fallback.
+	// "no_vid_cookie" is a Verisure placeholder — skip it.
+	var access, vid string
+	seen := make(map[string]bool)
+	var extraParts []string // vs-trust-* and vs-refresh as raw "name=value"
+
 	for _, base := range []string{c.loginBase, defaultLoginBase, fallbackLoginBase} {
 		u, _ := url.Parse(base)
 		for _, cookie := range c.jar.Cookies(u) {
-			switch cookie.Name {
-			case "vs-access":
-				if access == "" && cookie.Value != "" {
-					access = cookie.Value
-				}
-			case "vs-trust":
-				if trust == "" && cookie.Value != "" {
-					trust = cookie.Value
-				}
-			case "vid":
-				if vid == "" && cookie.Value != "" && cookie.Value != "no_vid_cookie" {
-					vid = cookie.Value
-				}
+			if seen[cookie.Name] || cookie.Value == "" {
+				continue
+			}
+			seen[cookie.Name] = true
+			switch {
+			case cookie.Name == "vs-access":
+				access = cookie.Value
+			case strings.HasPrefix(cookie.Name, "vs-trust") || cookie.Name == "vs-refresh":
+				extraParts = append(extraParts, cookie.Name+"="+cookie.Value)
+			case cookie.Name == "vid" && cookie.Value != "no_vid_cookie":
+				vid = cookie.Value
 			}
 		}
 	}
 
-	// Build "|"-separated pairs so all can be restored on next startup.
+	// Build "|"-separated "name=value" pairs for NewClient to restore.
 	var parts []string
 	if access != "" {
 		parts = append(parts, "vs-access="+access)
 	}
-	if trust != "" {
-		parts = append(parts, "vs-trust="+trust)
-	}
+	parts = append(parts, extraParts...)
 	if len(parts) == 0 && vid != "" {
 		parts = append(parts, "vid="+vid)
 	}
@@ -302,11 +309,10 @@ func (c *Client) loginLocked(ctx context.Context) error {
 			}
 			pending = &mfaState{loginBase: base, stepupCookie: stepup}
 		} else {
-			// No MFA: session cookies already in the jar — request trust so
-			// future re-logins also skip MFA.
+			// No MFA: session cookies already propagated above.
 			slog.Info("verisure: login succeeded (no MFA)")
 			c.loginBase = base
-			c.requestTrustLocked(ctx, base)
+			c.requestTrustLocked(ctx, base, "")
 		}
 		lastErr = nil
 		break
@@ -334,7 +340,7 @@ func (c *Client) loginLocked(ctx context.Context) error {
 		c.loginBase = pending.loginBase
 		c.pendingMFA = nil
 		// Request trust token so future re-logins skip MFA.
-		c.requestTrustLocked(ctx, pending.loginBase)
+		c.requestTrustLocked(ctx, pending.loginBase, pending.stepupCookie)
 	}
 
 	return c.finishLoginLocked(ctx)
@@ -404,7 +410,13 @@ func (c *Client) validateMFALocked(ctx context.Context, state *mfaState) error {
 		return fmt.Errorf("POST /auth/mfa/validate: HTTP %d: %s", resp.StatusCode, body)
 	}
 
-	c.propagateCookies(state.loginBase, resp.Cookies())
+	cookies := resp.Cookies()
+	slog.Info("verisure: mfa/validate response", "cookies_count", len(cookies))
+	for _, ck := range cookies {
+		slog.Info("verisure: mfa/validate set-cookie", "name", ck.Name,
+			"value_len", len(ck.Value), "path", ck.Path, "domain", ck.Domain)
+	}
+	c.propagateCookies(state.loginBase, cookies)
 	slog.Info("verisure: MFA code accepted")
 	return nil
 }
@@ -412,8 +424,9 @@ func (c *Client) validateMFALocked(ctx context.Context, state *mfaState) error {
 // requestTrustLocked calls POST /auth/trust to obtain a long-lived trust token.
 // With vs-trust in the cookie jar, future POST /auth/login calls return a fresh
 // vs-access token without triggering MFA again.
+// stepupCookie is the vs-stepup value from the MFA flow; pass "" on non-MFA paths.
 // Errors are non-fatal — the current session still works for its 10-minute window.
-func (c *Client) requestTrustLocked(ctx context.Context, loginBase string) {
+func (c *Client) requestTrustLocked(ctx context.Context, loginBase, stepupCookie string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		loginBase+"/auth/trust", http.NoBody)
 	if err != nil {
@@ -423,20 +436,30 @@ func (c *Client) requestTrustLocked(ctx context.Context, loginBase string) {
 	req.Header.Set("APPLICATION_ID", applicationID)
 	req.Header.Set("Accept", "application/json")
 	req.ContentLength = 0
+	// Some Verisure backends require the original MFA stepup cookie for /auth/trust.
+	if stepupCookie != "" {
+		req.AddCookie(&http.Cookie{Name: "vs-stepup", Value: stepupCookie})
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
 		slog.Warn("verisure: /auth/trust failed", "err", err)
 		return
 	}
-	io.Copy(io.Discard, resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		slog.Warn("verisure: /auth/trust non-200, re-login may require MFA again",
-			"status", resp.StatusCode)
+			"status", resp.StatusCode, "body", string(body))
 		return
 	}
-	c.propagateCookies(loginBase, resp.Cookies())
+	cookies := resp.Cookies()
+	slog.Info("verisure: /auth/trust response", "cookies_count", len(cookies), "body", string(body))
+	for _, ck := range cookies {
+		slog.Info("verisure: /auth/trust set-cookie", "name", ck.Name,
+			"value_len", len(ck.Value), "path", ck.Path, "domain", ck.Domain)
+	}
+	c.propagateCookies(loginBase, cookies)
 	slog.Info("verisure: trust token obtained — future re-logins will not require MFA")
 }
 
@@ -571,23 +594,19 @@ func (c *Client) setCookieOnAll(name, value string) {
 }
 
 func (c *Client) propagateCookies(loginBase string, cookies []*http.Cookie) {
-	// Set on the origin host with the original cookie attributes.
-	orig, _ := url.Parse(loginBase)
-	c.jar.SetCookies(orig, cookies)
-
-	// For other hosts, strip the Domain attribute so Go's cookiejar accepts
-	// them regardless of which automation server issued them.
-	stripped := make([]*http.Cookie, len(cookies))
+	// Normalise cookies: strip Domain so they're accepted by all automation
+	// servers, and set Path="/" so they're sent to all endpoints including
+	// /graphql (Verisure often returns cookies with Path=/auth which the
+	// cookiejar won't send to other paths).
+	normalized := make([]*http.Cookie, len(cookies))
 	for i, ck := range cookies {
 		cp := *ck
 		cp.Domain = ""
-		stripped[i] = &cp
+		cp.Path = "/"
+		normalized[i] = &cp
 	}
 	for _, base := range []string{defaultLoginBase, fallbackLoginBase, "https://www.verisure.com"} {
-		if base == loginBase {
-			continue
-		}
 		u, _ := url.Parse(base)
-		c.jar.SetCookies(u, stripped)
+		c.jar.SetCookies(u, normalized)
 	}
 }
