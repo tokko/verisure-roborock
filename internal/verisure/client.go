@@ -99,14 +99,18 @@ func NewClient(email, password, phone, persistedCookie string) (*Client, error) 
 		},
 	}
 	if persistedCookie != "" {
-		// persistedCookie is stored as "cookieName=cookieValue" by SessionCookie().
-		// Split on the first "=" so we restore the cookie under the right name.
-		if eq := strings.Index(persistedCookie, "="); eq > 0 {
-			name := persistedCookie[:eq]
-			value := persistedCookie[eq+1:]
-			c.setCookieOnAll(name, value)
+		// persistedCookie is stored as "|"-separated "name=value" pairs by SessionCookie().
+		// (legacy: single "name=value" pair)
+		restored := 0
+		for _, pair := range strings.Split(persistedCookie, "|") {
+			if eq := strings.Index(pair, "="); eq > 0 {
+				c.setCookieOnAll(pair[:eq], pair[eq+1:])
+				restored++
+			}
+		}
+		if restored > 0 {
 			c.authed = true
-			slog.Debug("verisure: restored session from store", "cookie_name", name)
+			slog.Debug("verisure: restored session from store", "cookies", restored)
 		} else {
 			slog.Warn("verisure: ignoring malformed persisted cookie")
 		}
@@ -122,24 +126,41 @@ func (c *Client) SubmitMFACode(code string) {
 }
 
 func (c *Client) SessionCookie() string {
-	// vs-access (JWT) is preferred over the legacy vid cookie.
+	// Collect vs-access (JWT) and vs-trust (long-lived trust token).
 	// "no_vid_cookie" is a Verisure placeholder set before MFA — skip it.
+	var access, trust, vid string
 	for _, base := range []string{c.loginBase, defaultLoginBase, fallbackLoginBase} {
 		u, _ := url.Parse(base)
-		var vidValue string
 		for _, cookie := range c.jar.Cookies(u) {
-			if cookie.Name == "vs-access" && cookie.Value != "" {
-				return "vs-access=" + cookie.Value
+			switch cookie.Name {
+			case "vs-access":
+				if access == "" && cookie.Value != "" {
+					access = cookie.Value
+				}
+			case "vs-trust":
+				if trust == "" && cookie.Value != "" {
+					trust = cookie.Value
+				}
+			case "vid":
+				if vid == "" && cookie.Value != "" && cookie.Value != "no_vid_cookie" {
+					vid = cookie.Value
+				}
 			}
-			if cookie.Name == "vid" && cookie.Value != "" && cookie.Value != "no_vid_cookie" {
-				vidValue = cookie.Value
-			}
-		}
-		if vidValue != "" {
-			return "vid=" + vidValue
 		}
 	}
-	return ""
+
+	// Build "|"-separated pairs so all can be restored on next startup.
+	var parts []string
+	if access != "" {
+		parts = append(parts, "vs-access="+access)
+	}
+	if trust != "" {
+		parts = append(parts, "vs-trust="+trust)
+	}
+	if len(parts) == 0 && vid != "" {
+		parts = append(parts, "vid="+vid)
+	}
+	return strings.Join(parts, "|")
 }
 
 func (c *Client) ArmState(ctx context.Context) (ArmState, error) {
@@ -281,9 +302,11 @@ func (c *Client) loginLocked(ctx context.Context) error {
 			}
 			pending = &mfaState{loginBase: base, stepupCookie: stepup}
 		} else {
-			// No MFA: session cookies already in the jar.
+			// No MFA: session cookies already in the jar — request trust so
+			// future re-logins also skip MFA.
 			slog.Info("verisure: login succeeded (no MFA)")
 			c.loginBase = base
+			c.requestTrustLocked(ctx, base)
 		}
 		lastErr = nil
 		break
@@ -310,6 +333,8 @@ func (c *Client) loginLocked(ctx context.Context) error {
 		}
 		c.loginBase = pending.loginBase
 		c.pendingMFA = nil
+		// Request trust token so future re-logins skip MFA.
+		c.requestTrustLocked(ctx, pending.loginBase)
 	}
 
 	return c.finishLoginLocked(ctx)
@@ -382,6 +407,37 @@ func (c *Client) validateMFALocked(ctx context.Context, state *mfaState) error {
 	c.propagateCookies(state.loginBase, resp.Cookies())
 	slog.Info("verisure: MFA code accepted")
 	return nil
+}
+
+// requestTrustLocked calls POST /auth/trust to obtain a long-lived trust token.
+// With vs-trust in the cookie jar, future POST /auth/login calls return a fresh
+// vs-access token without triggering MFA again.
+// Errors are non-fatal — the current session still works for its 10-minute window.
+func (c *Client) requestTrustLocked(ctx context.Context, loginBase string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		loginBase+"/auth/trust", http.NoBody)
+	if err != nil {
+		slog.Warn("verisure: /auth/trust request build failed", "err", err)
+		return
+	}
+	req.Header.Set("APPLICATION_ID", applicationID)
+	req.Header.Set("Accept", "application/json")
+	req.ContentLength = 0
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		slog.Warn("verisure: /auth/trust failed", "err", err)
+		return
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		slog.Warn("verisure: /auth/trust non-200, re-login may require MFA again",
+			"status", resp.StatusCode)
+		return
+	}
+	c.propagateCookies(loginBase, resp.Cookies())
+	slog.Info("verisure: trust token obtained — future re-logins will not require MFA")
 }
 
 // finishLoginLocked marks the session as authenticated.
