@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -89,19 +90,17 @@ func run() error {
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		st := st.Get()
 		type vacuumStatus struct {
-			Name          string    `json:"name"`
-			Host          string    `json:"host"`
-			StartedByUs   bool      `json:"started_by_us"`
-			LastCleanTime time.Time `json:"last_clean,omitempty"`
+			Name        string `json:"name"`
+			Host        string `json:"host"`
+			StartedByUs bool   `json:"started_by_us"`
 		}
 		var vs []vacuumStatus
 		for _, v := range cfg.Vacuums {
 			entry := st.Vacuums[v.Host]
 			vs = append(vs, vacuumStatus{
-				Name:          v.Name,
-				Host:          v.Host,
-				StartedByUs:   entry.StartedByUs,
-				LastCleanTime: entry.LastCleanTime,
+				Name:        v.Name,
+				Host:        v.Host,
+				StartedByUs: entry.StartedByUs,
 			})
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -112,7 +111,15 @@ func run() error {
 		})
 	})
 	// MFA code submission endpoint — operator POSTs SMS code here during login.
+	// Protected by MFA_SECRET bearer token when configured.
 	mux.HandleFunc("POST /mfa-code", func(w http.ResponseWriter, r *http.Request) {
+		if cfg.MFASecret != "" {
+			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if got != cfg.MFASecret {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 16))
 		if err != nil || len(body) == 0 {
 			http.Error(w, "provide the SMS code in the request body", http.StatusBadRequest)
@@ -125,8 +132,11 @@ func run() error {
 	})
 
 	srv := &http.Server{
-		Addr:    cfg.HTTPAddr,
-		Handler: mux,
+		Addr:              cfg.HTTPAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	go func() {
 		slog.Info("http server listening", "addr", cfg.HTTPAddr)
@@ -135,8 +145,23 @@ func run() error {
 		}
 	}()
 
-	// Periodically persist the Verisure session cookie so MFA is not repeated on restart.
+	// Persist Verisure session cookie so MFA is not repeated on restart.
+	// First persist fires 30s after startup (reconcile has completed by then),
+	// then every 5 min to keep it current.
+	persistCookie := func() {
+		if cookie := verisureClient.SessionCookie(); cookie != "" {
+			if err := st.SetVerisureCookie(cookie); err != nil {
+				slog.Error("persist verisure cookie", "err", err)
+			}
+		}
+	}
 	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(30 * time.Second):
+			persistCookie()
+		}
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -144,11 +169,7 @@ func run() error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if cookie := verisureClient.SessionCookie(); cookie != "" {
-					if err := st.SetVerisureCookie(cookie); err != nil {
-						slog.Error("persist verisure cookie", "err", err)
-					}
-				}
+				persistCookie()
 			}
 		}
 	}()
@@ -157,6 +178,9 @@ func run() error {
 	if err := ctrl.Run(ctx); err != nil && err != context.Canceled {
 		return err
 	}
+
+	// Persist cookie on graceful shutdown so MFA is not needed after a redeploy.
+	persistCookie()
 
 	// Graceful HTTP shutdown.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)

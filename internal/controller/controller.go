@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"verisure-roborock/internal/roborock"
@@ -57,8 +58,9 @@ type Controller struct {
 	pollInterval  time.Duration
 	cleanCooldown time.Duration
 
-	state        ControlState
-	lastAlarm    verisure.ArmState
+	mu        sync.RWMutex // protects state (read by HTTP handler, written by poll goroutine)
+	state     ControlState
+	lastAlarm verisure.ArmState
 }
 
 // New creates a Controller.
@@ -109,7 +111,12 @@ func (c *Controller) Run(ctx context.Context) error {
 }
 
 // State returns the current controller state (for the /status handler).
-func (c *Controller) State() ControlState { return c.state }
+// Safe to call from any goroutine.
+func (c *Controller) State() ControlState {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.state
+}
 
 // poll fetches the current alarm state and triggers transitions on change.
 // Returns true on success, false on error.
@@ -119,6 +126,8 @@ func (c *Controller) poll(ctx context.Context) bool {
 		slog.Warn("controller: poll failed", "err", err)
 		return false
 	}
+
+	slog.Debug("controller: polled alarm", "state", alarm)
 
 	if alarm == c.lastAlarm {
 		return true
@@ -142,6 +151,7 @@ func (c *Controller) poll(ctx context.Context) bool {
 func (c *Controller) onArmedAway(ctx context.Context) {
 	slog.Info("controller: alarm armed-away — checking vacuums")
 	anyStarted := false
+	countStarted := 0
 
 	for _, v := range c.vacuums {
 		started, err := c.maybeStartVacuum(ctx, v)
@@ -151,6 +161,7 @@ func (c *Controller) onArmedAway(ctx context.Context) {
 		}
 		if started {
 			anyStarted = true
+			countStarted++
 		}
 	}
 
@@ -158,6 +169,11 @@ func (c *Controller) onArmedAway(ctx context.Context) {
 	if anyStarted {
 		newState = StateCleaningActive
 	}
+	slog.Info("controller: onArmedAway complete",
+		"started", countStarted,
+		"total", len(c.vacuums),
+		"new_state", newState,
+	)
 	c.setState(newState)
 }
 
@@ -169,7 +185,7 @@ func (c *Controller) maybeStartVacuum(ctx context.Context, v VacuumCommander) (b
 		return false, fmt.Errorf("get status: %w", err)
 	}
 
-	slog.Debug("controller: vacuum status", "name", v.Name(), "state", status.State, "battery", status.Battery)
+	slog.Info("controller: vacuum status", "name", v.Name(), "state", status.State, "battery", status.Battery)
 
 	switch {
 	case status.State.IsError():
@@ -184,6 +200,10 @@ func (c *Controller) maybeStartVacuum(ctx context.Context, v VacuumCommander) (b
 		// Already cleaning — not started by us (we didn't set StartedByUs).
 		slog.Info("controller: vacuum already cleaning (manual), noting", "name", v.Name())
 		return false, nil
+
+	case !status.State.IsIdle() && !status.State.IsPaused():
+		slog.Warn("controller: vacuum in unexpected state, skipping", "name", v.Name(), "state", status.State)
+		return false, nil
 	}
 
 	// Check cleaning history.
@@ -195,10 +215,10 @@ func (c *Controller) maybeStartVacuum(ctx context.Context, v VacuumCommander) (b
 
 	lastClean := summary.LastCleanTime()
 	if !lastClean.IsZero() && time.Since(lastClean) < c.cleanCooldown {
-		slog.Info("controller: recent clean found, skipping",
+		slog.Info("controller: skipping — cleaned recently",
 			"name", v.Name(),
 			"last_clean", lastClean,
-			"age", time.Since(lastClean).Round(time.Minute),
+			"cooldown_remaining", (c.cleanCooldown - time.Since(lastClean)).Round(time.Minute),
 		)
 		return false, nil
 	}
@@ -213,6 +233,11 @@ func (c *Controller) maybeStartVacuum(ctx context.Context, v VacuumCommander) (b
 		)
 	}
 
+	slog.Info("controller: starting vacuum",
+		"name", v.Name(),
+		"battery", status.Battery,
+		"last_clean", lastClean,
+	)
 	if err := v.StartOrResume(ctx, status.State.IsPaused()); err != nil {
 		return false, fmt.Errorf("start: %w", err)
 	}
@@ -258,6 +283,7 @@ func (c *Controller) stopVacuum(ctx context.Context, v VacuumCommander) {
 		return
 	}
 
+	slog.Info("controller: stopping vacuum", "name", v.Name(), "state", status.State)
 	if err := withRetrySingle(ctx, 3, 2*time.Second, 30*time.Second, func() error {
 		return v.Pause(ctx)
 	}); err != nil {
@@ -336,9 +362,9 @@ func (c *Controller) reconcileOnStartup(ctx context.Context) {
 		case alarm.IsArmedAway() && (status.State.IsIdle() || status.State.IsError()):
 			// We crashed mid-clean and the vacuum stopped — restart it.
 			slog.Warn("controller: vacuum stopped mid-clean, restarting", "name", v.Name())
-			if err := v.StartOrResume(ctx, false); err != nil {
+			if started, err := c.maybeStartVacuum(ctx, v); err != nil {
 				slog.Error("controller: restart failed", "name", v.Name(), "err", err)
-			} else {
+			} else if started {
 				anyActive = true
 			}
 
@@ -364,7 +390,9 @@ func (c *Controller) reconcileOnStartup(ctx context.Context) {
 }
 
 func (c *Controller) setState(s ControlState) {
+	c.mu.Lock()
 	c.state = s
+	c.mu.Unlock()
 	if err := c.store.SetControlState(s.String()); err != nil {
 		slog.Error("controller: persist control state", "err", err)
 	}

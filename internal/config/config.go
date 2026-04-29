@@ -46,8 +46,9 @@ type Config struct {
 	StorePath string
 
 	// Observability
-	HTTPAddr string
-	LogLevel string
+	HTTPAddr  string
+	LogLevel  string
+	MFASecret string // optional bearer token protecting the /mfa-code endpoint
 }
 
 // Load reads configuration from .env (if present) then environment variables.
@@ -104,9 +105,10 @@ func Load() (*Config, error) {
 		PollInterval:    duration("POLL_INTERVAL", 60*time.Second),
 		CleanCooldown:   duration("CLEAN_COOLDOWN", 24*time.Hour),
 		RoborockTimeout: duration("ROBOROCK_TIMEOUT", 10*time.Second),
-		StorePath:       optional("STORE_PATH", "./state.json"),
-		HTTPAddr:        optional("HTTP_ADDR", ":8080"),
-		LogLevel:        optional("LOG_LEVEL", "info"),
+		StorePath: optional("STORE_PATH", "./state.json"),
+		HTTPAddr:  optional("HTTP_ADDR", ":8080"),
+		LogLevel:  optional("LOG_LEVEL", "info"),
+		MFASecret: optional("MFA_SECRET", ""),
 	}
 
 	// Load vacuums: ROBOROCK_0_HOST, ROBOROCK_0_TOKEN, ROBOROCK_0_NAME, ...
@@ -134,6 +136,15 @@ func Load() (*Config, error) {
 
 	if len(cfg.Vacuums) == 0 {
 		missing = append(missing, "ROBOROCK_0_HOST (at least one vacuum required; run 'make fetch-tokens' to discover)")
+	}
+
+	// Guard against duplicate vacuum hosts (would cause a store key collision).
+	seenHosts := make(map[string]bool, len(cfg.Vacuums))
+	for _, v := range cfg.Vacuums {
+		if seenHosts[v.Host] {
+			missing = append(missing, fmt.Sprintf("duplicate ROBOROCK host %q — each vacuum must have a unique IP", v.Host))
+		}
+		seenHosts[v.Host] = true
 	}
 
 	if len(missing) > 0 {

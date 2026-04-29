@@ -4,14 +4,12 @@ import (
 	"encoding/json"
 	"os"
 	"sync"
-	"time"
 )
 
 // VacuumEntry holds per-vacuum persistent state.
 type VacuumEntry struct {
-	Name          string    `json:"name"`
-	LastCleanTime time.Time `json:"last_clean_time"`
-	StartedByUs   bool      `json:"started_by_us"`
+	Name        string `json:"name"`
+	StartedByUs bool   `json:"started_by_us"`
 }
 
 // State is the full persisted state, written atomically to disk.
@@ -87,15 +85,6 @@ func (s *Store) SetVacuumStartedByUs(host string, v bool) error {
 	defer s.mu.Unlock()
 	e := s.s.Vacuums[host]
 	e.StartedByUs = v
-	s.s.Vacuums[host] = e
-	return s.save()
-}
-
-func (s *Store) SetVacuumLastClean(host string, t time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	e := s.s.Vacuums[host]
-	e.LastCleanTime = t
 	s.s.Vacuums[host] = e
 	return s.save()
 }

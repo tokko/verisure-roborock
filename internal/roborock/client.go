@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -202,8 +203,13 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 
 	result, err := c.callLocked(ctx, method, params)
 	if err != nil {
-		// On checksum error or timeout, re-handshake and retry once.
-		slog.Debug("roborock: call failed, re-handshaking", "name", c.name, "err", err)
+		if !isProtocolError(err) {
+			// RPC-level errors (e.g. device busy, bad params) — don't re-handshake.
+			slog.Debug("roborock: call failed (rpc error, no re-handshake)", "name", c.name, "err", err)
+			return nil, err
+		}
+		// Network/protocol errors — re-handshake and retry once.
+		slog.Debug("roborock: call failed (protocol error), re-handshaking", "name", c.name, "err", err)
 		c.handshook = false
 		if hsErr := c.handshakeLocked(ctx); hsErr != nil {
 			return nil, fmt.Errorf("roborock %s re-handshake: %w", c.name, hsErr)
@@ -211,6 +217,23 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 		result, err = c.callLocked(ctx, method, params)
 	}
 	return result, err
+}
+
+// isProtocolError reports whether err is a network or protocol-level failure
+// (checksum, framing, encrypt/decrypt, send/recv) as opposed to an RPC-level
+// error returned by the device (e.g. "device busy", error code -9).
+// Only protocol errors should trigger a re-handshake.
+func isProtocolError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "checksum") ||
+		strings.Contains(s, "recv:") ||
+		strings.Contains(s, "send:") ||
+		strings.Contains(s, "handshake") ||
+		strings.Contains(s, "frame") ||
+		strings.Contains(s, "decrypt")
 }
 
 type rpcRequest struct {
