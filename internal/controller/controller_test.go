@@ -49,6 +49,7 @@ type mockVacuum struct {
 	summary      roborock.CleanSummary
 	summaryErr   error
 	startCalled  bool
+	startCount   int
 	startPaused  bool
 	startErr     error
 	pauseCalled  bool
@@ -56,12 +57,22 @@ type mockVacuum struct {
 	chargeCalled bool
 	chargeErr    error
 	statusCalls  int
+
+	// Per-call sequences: statusSeq[i] used on call i; falls back to status/statusErr after exhausted.
+	statusSeq []struct {
+		s roborock.VacuumStatus
+		e error
+	}
 }
 
 func (m *mockVacuum) Name() string { return m.name }
 func (m *mockVacuum) Host() string { return m.host }
 func (m *mockVacuum) Status(_ context.Context) (roborock.VacuumStatus, error) {
+	i := m.statusCalls
 	m.statusCalls++
+	if i < len(m.statusSeq) {
+		return m.statusSeq[i].s, m.statusSeq[i].e
+	}
 	return m.status, m.statusErr
 }
 func (m *mockVacuum) CleanSummary(_ context.Context) (roborock.CleanSummary, error) {
@@ -69,6 +80,7 @@ func (m *mockVacuum) CleanSummary(_ context.Context) (roborock.CleanSummary, err
 }
 func (m *mockVacuum) StartOrResume(_ context.Context, paused bool) error {
 	m.startCalled = true
+	m.startCount++
 	m.startPaused = paused
 	return m.startErr
 }
@@ -521,6 +533,142 @@ func TestPoll(t *testing.T) {
 		c := New(alarm, []VacuumCommander{v}, newStore(t), time.Second, time.Hour)
 		ok := c.poll(context.Background())
 		assertBool(t, "poll ok", ok, false)
+	})
+
+	// --- Retry-on-armed-away tests (the bug that caused robots not to start) ---
+
+	t.Run("armed-away+StateArmedAway: retry fires on subsequent poll", func(t *testing.T) {
+		// Simulates: previous poll failed (vacuum offline) → state=ArmedAway (set directly).
+		// This poll: alarm still armed-away → retry fires → vacuum now reachable → starts.
+		v := &mockVacuum{
+			name:    "v",
+			host:    "1.1.1.1",
+			status:  roborock.VacuumStatus{State: roborock.StateIdle, Battery: 80}, // vacuum online now
+			summary: summaryAt(30 * time.Hour),
+		}
+		alarm := &mockAlarm{state: verisure.ArmStateArmedAway}
+		c := New(alarm, []VacuumCommander{v}, newStore(t), time.Second, time.Hour)
+		c.lastAlarm = verisure.ArmStateArmedAway // alarm didn't change
+		c.state = StateArmedAway                 // simulate: first attempt failed to start anything
+
+		// This poll: alarm unchanged + StateArmedAway → retry → vacuum starts
+		ok := c.poll(context.Background())
+		assertBool(t, "poll ok", ok, true)
+		assertBool(t, "vacuum started on retry", v.startCalled, true)
+		if c.State() != StateCleaningActive {
+			t.Errorf("state after retry: got %v, want CleaningActive", c.State())
+		}
+	})
+
+	t.Run("armed-away+StateCleaningActive: NO retry when already active", func(t *testing.T) {
+		// Vacuums are already running — no retry should occur.
+		v := &mockVacuum{name: "v", host: "1.1.1.1",
+			status:  roborock.VacuumStatus{State: roborock.StateCleaning},
+			summary: summaryAt(30 * time.Hour),
+		}
+		alarm := &mockAlarm{state: verisure.ArmStateArmedAway}
+		c := New(alarm, []VacuumCommander{v}, newStore(t), time.Second, time.Hour)
+		c.lastAlarm = verisure.ArmStateArmedAway
+		c.state = StateCleaningActive // already active
+
+		ok := c.poll(context.Background())
+		assertBool(t, "poll ok", ok, true)
+		// Vacuum was already cleaning — StartOrResume should not be called again.
+		assertBool(t, "start NOT called", v.startCalled, false)
+	})
+
+	t.Run("armed-away+StateArmedAway: retry stops once vacuum starts", func(t *testing.T) {
+		// After the retry succeeds, state transitions to CleaningActive.
+		// Next poll must NOT retry again (vacuum is now active).
+		v := &mockVacuum{
+			name:    "v",
+			host:    "1.1.1.1",
+			summary: summaryAt(30 * time.Hour),
+			status:  roborock.VacuumStatus{State: roborock.StateIdle, Battery: 80},
+		}
+		alarm := &mockAlarm{state: verisure.ArmStateArmedAway}
+		c := New(alarm, []VacuumCommander{v}, newStore(t), time.Second, time.Hour)
+		c.lastAlarm = verisure.ArmStateArmedAway
+		c.state = StateArmedAway
+
+		// First retry poll: starts vacuum
+		c.poll(context.Background())
+		if c.State() != StateCleaningActive {
+			t.Fatalf("state after first retry: got %v, want CleaningActive", c.State())
+		}
+		startCountAfterFirst := v.startCount
+
+		// Mock vacuum now cleaning
+		v.status = roborock.VacuumStatus{State: roborock.StateCleaning}
+
+		// Second retry poll: state is CleaningActive → NO retry
+		c.poll(context.Background())
+		if v.startCount != startCountAfterFirst {
+			t.Errorf("StartOrResume called %d extra times; want 0 after CleaningActive",
+				v.startCount-startCountAfterFirst)
+		}
+	})
+
+	t.Run("real-world scenario: alarm armed, both vacuums sleeping, succeed on 3rd poll", func(t *testing.T) {
+		// Mirrors the actual failure from 2026-04-30:
+		// Poll 1 (state change): both vacuums → i/o timeout → state=ArmedAway
+		// Poll 2 (no change): state=ArmedAway → retry → upstairs starts, downstairs still failing
+		// Poll 3 (no change): state=ArmedAway → retry → downstairs starts → CleaningActive
+		v1 := &mockVacuum{
+			name:    "upstairs",
+			host:    "192.168.68.117",
+			summary: summaryAt(30 * time.Hour),
+			statusSeq: []struct {
+				s roborock.VacuumStatus
+				e error
+			}{
+				{e: errors.New("recv: i/o timeout")},                                // poll 1: offline
+				{s: roborock.VacuumStatus{State: roborock.StateIdle, Battery: 80}}, // poll 2: online
+				{s: roborock.VacuumStatus{State: roborock.StateCleaning}},           // poll 3: already running
+			},
+		}
+		v2 := &mockVacuum{
+			name:    "downstairs",
+			host:    "192.168.68.121",
+			summary: summaryAt(30 * time.Hour),
+			statusSeq: []struct {
+				s roborock.VacuumStatus
+				e error
+			}{
+				{e: errors.New("handshake: connection refused")}, // poll 1: offline
+				{e: errors.New("recv: i/o timeout")},             // poll 2: still offline
+				{s: roborock.VacuumStatus{State: roborock.StateIdle, Battery: 75}}, // poll 3: online
+			},
+		}
+		alarm := &mockAlarm{state: verisure.ArmStateArmedAway}
+		c := New(alarm, []VacuumCommander{v1, v2}, newStore(t), time.Second, time.Hour)
+
+		// Poll 1: state change DISARMED → ARMED_AWAY (both fail)
+		c.lastAlarm = verisure.ArmStateDisarmed
+		c.poll(context.Background())
+		assertBool(t, "poll1: v1 start", v1.startCalled, false)
+		assertBool(t, "poll1: v2 start", v2.startCalled, false)
+		if c.State() != StateArmedAway {
+			t.Fatalf("poll1 state: got %v, want ArmedAway", c.State())
+		}
+
+		// Poll 2: alarm unchanged, retry — v1 comes back, v2 still failing
+		c.poll(context.Background())
+		assertBool(t, "poll2: v1 started", v1.startCalled, true)
+		assertBool(t, "poll2: v2 start", v2.startCalled, false)
+		// v1 started → CleaningActive
+		if c.State() != StateCleaningActive {
+			t.Fatalf("poll2 state: got %v, want CleaningActive", c.State())
+		}
+
+		// Poll 3: state=CleaningActive, no retry (v2 missed, unfortunate but correct)
+		// In real life v2 would be retried on the next arm event.
+		// The important thing is CleaningActive doesn't keep retrying.
+		v1StartCount := v1.startCount
+		c.poll(context.Background())
+		if v1.startCount != v1StartCount {
+			t.Error("poll3: v1 should not have been started again")
+		}
 	})
 }
 

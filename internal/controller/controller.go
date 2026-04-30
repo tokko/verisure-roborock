@@ -130,6 +130,14 @@ func (c *Controller) poll(ctx context.Context) bool {
 	slog.Debug("controller: polled alarm", "state", alarm)
 
 	if alarm == c.lastAlarm {
+		// If armed-away but no vacuums are running yet, retry on every poll.
+		// This handles the common case where vacuums are sleeping or still
+		// re-connecting to WiFi when the alarm is first set — they'll be
+		// retried each poll interval until they respond.
+		if alarm.IsArmedAway() && c.State() == StateArmedAway {
+			slog.Info("controller: armed-away with no active vacuums — retrying start")
+			c.onArmedAway(ctx)
+		}
 		return true
 	}
 

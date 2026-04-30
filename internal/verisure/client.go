@@ -460,6 +460,21 @@ func (c *Client) requestTrustLocked(ctx context.Context, loginBase, stepupCookie
 			"value_len", len(ck.Value), "path", ck.Path, "domain", ck.Domain)
 	}
 	c.propagateCookies(loginBase, cookies)
+
+	// Verisure returns the trust token in the JSON body (not as Set-Cookie).
+	// Parse it and inject it into the cookie jar so future logins skip MFA.
+	var trustBody struct {
+		TrustTokenName  string `json:"trustTokenName"`
+		TrustTokenValue string `json:"trustTokenValue"`
+	}
+	if err := json.Unmarshal(body, &trustBody); err == nil &&
+		trustBody.TrustTokenName != "" && trustBody.TrustTokenValue != "" {
+		c.propagateCookies(loginBase, []*http.Cookie{{
+			Name:  trustBody.TrustTokenName,
+			Value: trustBody.TrustTokenValue,
+		}})
+		slog.Info("verisure: trust token saved to cookie jar", "name", trustBody.TrustTokenName)
+	}
 	slog.Info("verisure: trust token obtained — future re-logins will not require MFA")
 }
 
