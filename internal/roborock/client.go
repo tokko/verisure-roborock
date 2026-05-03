@@ -84,6 +84,11 @@ func (c *Client) closeConnLocked() {
 }
 
 func (c *Client) handshakeLocked(ctx context.Context) error {
+	// Always start fresh: close any existing connection so we get a new
+	// ephemeral port. A connected UDP socket that has timed out or received
+	// ICMP unreachable is permanently broken — re-dialling is the only fix.
+	c.closeConnLocked()
+
 	conn, err := c.dialLocked()
 	if err != nil {
 		return err
