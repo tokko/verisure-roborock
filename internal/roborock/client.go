@@ -69,6 +69,20 @@ func (c *Client) Handshake(ctx context.Context) error {
 	return c.handshakeLocked(ctx)
 }
 
+// closeConnLocked closes and nils the UDP connection so the next call creates a
+// fresh socket on a new ephemeral port. A connected UDP socket on Linux that
+// receives an ICMP "port unreachable" (ECONNREFUSED) or times out becomes
+// permanently broken — all subsequent reads return the same error. We must
+// discard it and re-dial to recover.
+// Must be called with c.mu held.
+func (c *Client) closeConnLocked() {
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+	}
+	c.handshook = false
+}
+
 func (c *Client) handshakeLocked(ctx context.Context) error {
 	conn, err := c.dialLocked()
 	if err != nil {
@@ -82,12 +96,14 @@ func (c *Client) handshakeLocked(ctx context.Context) error {
 	conn.SetDeadline(deadline)
 
 	if _, err := conn.Write(helloPacket()); err != nil {
+		c.closeConnLocked()
 		return fmt.Errorf("handshake write: %w", err)
 	}
 
 	buf := make([]byte, readBufSize)
 	n, err := conn.Read(buf)
 	if err != nil {
+		c.closeConnLocked()
 		return fmt.Errorf("handshake read: %w", err)
 	}
 
@@ -282,12 +298,14 @@ func (c *Client) callLocked(ctx context.Context, method string, params any) (jso
 	conn.SetDeadline(deadline)
 
 	if _, err := conn.Write(pkt); err != nil {
+		c.closeConnLocked()
 		return nil, fmt.Errorf("send: %w", err)
 	}
 
 	buf := make([]byte, readBufSize)
 	n, err := conn.Read(buf)
 	if err != nil {
+		c.closeConnLocked()
 		return nil, fmt.Errorf("recv: %w", err)
 	}
 
