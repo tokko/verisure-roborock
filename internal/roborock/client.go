@@ -61,6 +61,14 @@ func (c *Client) Name() string { return c.name }
 // Host returns the vacuum's IP address.
 func (c *Client) Host() string { return c.host }
 
+// DeviceID returns the hardware device ID received in the hello handshake.
+// Returns 0 if Handshake has not been called yet.
+func (c *Client) DeviceID() uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deviceID
+}
+
 // Handshake sends the hello packet and captures the device ID and stamp.
 // Called automatically by call() if not yet done, and on checksum errors.
 func (c *Client) Handshake(ctx context.Context) error {

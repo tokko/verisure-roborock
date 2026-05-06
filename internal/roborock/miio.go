@@ -21,17 +21,21 @@ type frame struct {
 	payload  []byte // decrypted JSON
 }
 
-// keys holds the AES key and IV derived from a device token.
+// keys holds the AES key, IV, and raw token derived from a device token.
 type keys struct {
-	key []byte // md5(token)
-	iv  []byte // md5(key + token)
+	key   []byte // md5(token)     — AES-128 key
+	iv    []byte // md5(key+token) — AES CBC IV
+	token []byte // raw 16-byte token — used verbatim in checksum
 }
 
 // deriveKeys computes the AES key and IV from a raw 16-byte token.
 func deriveKeys(token []byte) keys {
 	k := md5sum(token)
 	iv := md5sum(append(k, token...))
-	return keys{key: k, iv: iv}
+	// Keep a copy of the raw token: miIO checksum = MD5(header + raw_token + payload).
+	raw := make([]byte, len(token))
+	copy(raw, token)
+	return keys{key: k, iv: iv, token: raw}
 }
 
 func md5sum(b []byte) []byte {
@@ -57,7 +61,7 @@ func encode(f frame, k keys) ([]byte, error) {
 	// Checksum bytes 16-31: initially zero for calculation.
 	copy(buf[32:], encrypted)
 
-	checksum := computeChecksum(buf, k.key, encrypted)
+	checksum := computeChecksum(buf, k.token, encrypted)
 	copy(buf[16:32], checksum)
 
 	return buf, nil
@@ -95,7 +99,7 @@ func decode(buf []byte, k keys) (frame, error) {
 	for i := 16; i < 32; i++ {
 		buf[i] = 0
 	}
-	gotChecksum := computeChecksum(buf, k.key, encrypted)
+	gotChecksum := computeChecksum(buf, k.token, encrypted)
 	for i := 16; i < 32; i++ {
 		buf[i] = wantChecksum[i-16]
 	}

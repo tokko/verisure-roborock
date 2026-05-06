@@ -112,6 +112,8 @@ func fetchViaRoborock(ctx context.Context, email, region string) ([]tokenDevice,
 
 	var out []tokenDevice
 	for _, d := range cloudDevices {
+		fmt.Fprintf(os.Stderr, "[roborock] device: duid=%s name=%q ip=%s online=%v\n",
+			d.DUID, d.Name, d.LocalIP(), d.Online)
 		out = append(out, tokenDevice{
 			Name:  d.Name,
 			IP:    d.LocalIP(),

@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// TestDeriveKeys verifies key=MD5(token), iv=MD5(key||token).
+// TestDeriveKeys verifies key=MD5(token), iv=MD5(key||token), token=raw copy.
 func TestDeriveKeys(t *testing.T) {
 	t.Run("known token", func(t *testing.T) {
 		token := []byte("0123456789abcdef") // 16 bytes
@@ -30,6 +30,15 @@ func TestDeriveKeys(t *testing.T) {
 		}
 		if len(k.iv) != 16 {
 			t.Errorf("iv length = %d, want 16", len(k.iv))
+		}
+
+		// Raw token must be stored exactly — it is used verbatim for checksum.
+		if !bytes.Equal(k.token, token) {
+			t.Errorf("token field mismatch:\n got=%x\nwant=%x", k.token, token)
+		}
+		// Must be a copy, not the same slice.
+		if &k.token[0] == &token[0] {
+			t.Error("token field shares backing array with input — must be a copy")
 		}
 	})
 
@@ -127,6 +136,55 @@ func TestChecksumVerification(t *testing.T) {
 			t.Errorf("expected checksum error, got %v", err)
 		}
 	})
+}
+
+// TestChecksumUsesRawToken verifies that the checksum field in an encoded frame
+// is MD5(header + raw_token + payload), NOT MD5(header + md5(token) + payload).
+// This matches the miIO protocol spec and what Roborock vacuums expect.
+// If this test fails, the vacuum will silently drop every authenticated command.
+func TestChecksumUsesRawToken(t *testing.T) {
+	rawToken := bytes.Repeat([]byte{0x42}, 16) // arbitrary non-zero token
+	k := deriveKeys(rawToken)
+
+	f := frame{deviceID: 1, stamp: 2, payload: []byte(`{"method":"get_status"}`)}
+	buf, err := encode(f, k)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	// Extract stored checksum (bytes 16-31).
+	storedChecksum := make([]byte, 16)
+	copy(storedChecksum, buf[16:32])
+
+	// Recompute with raw token (correct).
+	headerZeroed := make([]byte, len(buf))
+	copy(headerZeroed, buf)
+	for i := 16; i < 32; i++ {
+		headerZeroed[i] = 0
+	}
+	h := md5.New()
+	h.Write(headerZeroed[:32])
+	h.Write(rawToken) // raw token — what the vacuum expects
+	h.Write(buf[32:])
+	wantChecksum := h.Sum(nil)
+
+	if !bytes.Equal(storedChecksum, wantChecksum) {
+		t.Errorf("checksum mismatch: encoded packet uses wrong token in checksum\n"+
+			" got (stored) = %x\nwant (raw token) = %x\n"+
+			"This means the vacuum will silently drop all commands.", storedChecksum, wantChecksum)
+	}
+
+	// Also confirm it does NOT match md5(token)-based checksum.
+	md5Token := md5.Sum(rawToken)
+	h2 := md5.New()
+	h2.Write(headerZeroed[:32])
+	h2.Write(md5Token[:]) // wrong: md5(token) instead of raw token
+	h2.Write(buf[32:])
+	wrongChecksum := h2.Sum(nil)
+
+	if bytes.Equal(storedChecksum, wrongChecksum) {
+		t.Error("checksum matches md5(token) variant — should match raw token variant")
+	}
 }
 
 func TestDecodeErrors(t *testing.T) {
