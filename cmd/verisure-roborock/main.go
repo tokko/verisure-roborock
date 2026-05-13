@@ -88,7 +88,7 @@ func run() error {
 			if err != nil {
 				return fmt.Errorf("roborock client %s: %w", vc.Name, err)
 			}
-			vacuums = append(vacuums, rc)
+			vacuums = append(vacuums, withAlarmRooms(rc, vc.AlarmRooms))
 		case "xiaomi":
 			xiaomiVacuums = append(xiaomiVacuums, vc)
 		case "roborock":
@@ -103,7 +103,7 @@ func run() error {
 			if err != nil {
 				return fmt.Errorf("roborock app cloud client %s: %w", vc.Name, err)
 			}
-			vacuums = append(vacuums, rc)
+			vacuums = append(vacuums, withAlarmRooms(rc, vc.AlarmRooms))
 		default:
 			return fmt.Errorf("unsupported roborock backend %q for %s", vc.Backend, vc.Name)
 		}
@@ -127,8 +127,8 @@ func run() error {
 				return fmt.Errorf("roborock cloud clients: %w", err)
 			}
 		}
-		for _, rc := range cloudVacuums {
-			vacuums = append(vacuums, rc)
+		for i, rc := range cloudVacuums {
+			vacuums = append(vacuums, withAlarmRooms(rc, xiaomiVacuums[i].AlarmRooms))
 		}
 	}
 
@@ -247,6 +247,35 @@ func run() error {
 
 	slog.Info("shutdown complete")
 	return nil
+}
+
+type alarmRoomVacuum struct {
+	controller.VacuumCommander
+	cleaner roomCleaner
+	rooms   []int
+}
+
+func withAlarmRooms(v controller.VacuumCommander, rooms []int) controller.VacuumCommander {
+	if len(rooms) == 0 {
+		return v
+	}
+	cleaner, ok := v.(roomCleaner)
+	if !ok {
+		return v
+	}
+	return alarmRoomVacuum{
+		VacuumCommander: v,
+		cleaner:         cleaner,
+		rooms:           append([]int(nil), rooms...),
+	}
+}
+
+func (v alarmRoomVacuum) AlarmRooms() []int {
+	return append([]int(nil), v.rooms...)
+}
+
+func (v alarmRoomVacuum) CleanRooms(ctx context.Context, rooms []int, repeat int) error {
+	return v.cleaner.CleanRooms(ctx, rooms, repeat)
 }
 
 func authenticateXiaomi(ctx context.Context, cfg *config.Config, cloud *xiaomi.CloudClient) error {

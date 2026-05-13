@@ -86,7 +86,7 @@ func TestRobotAPIListStartStopAndRooms(t *testing.T) {
 	registerRobotHandlers(mux,
 		[]config.VacuumConfig{
 			{Name: upstairs.name, Host: upstairs.host, Backend: "roborock"},
-			{Name: downstairs.name, Host: downstairs.host, Backend: "roborock"},
+			{Name: downstairs.name, Host: downstairs.host, Backend: "roborock", AlarmRooms: []int{16, 18}},
 		},
 		[]robotVacuum{upstairs, downstairs},
 		st,
@@ -105,6 +105,7 @@ func TestRobotAPIListStartStopAndRooms(t *testing.T) {
 				Host        string `json:"host"`
 				Backend     string `json:"backend"`
 				StartedByUs bool   `json:"started_by_us"`
+				AlarmRooms  []int  `json:"alarm_rooms"`
 			} `json:"robots"`
 		}
 		if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
@@ -118,6 +119,9 @@ func TestRobotAPIListStartStopAndRooms(t *testing.T) {
 		}
 		if got.Robots[1].Backend != "roborock" {
 			t.Fatalf("second backend = %q", got.Robots[1].Backend)
+		}
+		if len(got.Robots[1].AlarmRooms) != 2 || got.Robots[1].AlarmRooms[0] != 16 || got.Robots[1].AlarmRooms[1] != 18 {
+			t.Fatalf("second alarm rooms = %+v", got.Robots[1].AlarmRooms)
 		}
 	})
 

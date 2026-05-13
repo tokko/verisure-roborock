@@ -25,6 +25,7 @@ type robotInfo struct {
 	Host        string `json:"host"`
 	Backend     string `json:"backend"`
 	StartedByUs bool   `json:"started_by_us"`
+	AlarmRooms  []int  `json:"alarm_rooms,omitempty"`
 }
 
 type startRobotRequest struct {
@@ -42,6 +43,7 @@ func registerRobotHandlers(mux *http.ServeMux, cfg []config.VacuumConfig, vacuum
 				Host:        v.Host(),
 				Backend:     backendForVacuum(cfg, v),
 				StartedByUs: state.Vacuums[v.Host()].StartedByUs,
+				AlarmRooms:  alarmRoomsForVacuum(cfg, v),
 			})
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"robots": robots})
@@ -116,6 +118,15 @@ func registerRobotHandlers(mux *http.ServeMux, cfg []config.VacuumConfig, vacuum
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "robot": v.Name(), "action": "stop"})
 	})
+}
+
+func alarmRoomsForVacuum(cfg []config.VacuumConfig, v robotVacuum) []int {
+	for _, vc := range cfg {
+		if vc.Host == v.Host() || strings.EqualFold(vc.Name, v.Name()) {
+			return append([]int(nil), vc.AlarmRooms...)
+		}
+	}
+	return nil
 }
 
 func backendForVacuum(cfg []config.VacuumConfig, v robotVacuum) string {

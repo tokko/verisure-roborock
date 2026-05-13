@@ -11,11 +11,12 @@ import (
 
 // VacuumConfig holds per-device Roborock configuration.
 type VacuumConfig struct {
-	Host    string
-	Token   string // 32-char hex device token
-	Name    string // human-readable label for logs
-	DID     string // Xiaomi cloud device ID; optional when host/token can match
-	Backend string // "roborock", "xiaomi", or "local"
+	Host       string
+	Token      string // 32-char hex device token
+	Name       string // human-readable label for logs
+	DID        string // Xiaomi cloud device ID; optional when host/token can match
+	Backend    string // "roborock", "xiaomi", or "local"
+	AlarmRooms []int  // room/segment IDs to clean when alarm arms away; empty means full clean
 }
 
 // Config holds all runtime configuration.
@@ -104,6 +105,27 @@ func Load() (*Config, error) {
 		}
 		return v
 	}
+	intList := func(key string) []int {
+		s := strings.TrimSpace(os.Getenv(key))
+		if s == "" {
+			return nil
+		}
+		parts := strings.Split(s, ",")
+		values := make([]int, 0, len(parts))
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			v, err := strconv.Atoi(part)
+			if err != nil || v <= 0 {
+				missing = append(missing, key+" (invalid room id: "+part+")")
+				continue
+			}
+			values = append(values, v)
+		}
+		return values
+	}
 
 	verisureEmail := require("VERISURE_EMAIL")
 	verisurePassword := require("VERISURE_PASSWORD")
@@ -187,11 +209,12 @@ func Load() (*Config, error) {
 			}
 		}
 		cfg.Vacuums = append(cfg.Vacuums, VacuumConfig{
-			Host:    host,
-			Token:   token,
-			Name:    name,
-			DID:     did,
-			Backend: backend,
+			Host:       host,
+			Token:      token,
+			Name:       name,
+			DID:        did,
+			Backend:    backend,
+			AlarmRooms: intList(prefix + "ALARM_ROOMS"),
 		})
 	}
 

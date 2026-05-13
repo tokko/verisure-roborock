@@ -50,6 +50,11 @@ type VacuumCommander interface {
 	Charge(ctx context.Context) error
 }
 
+type alarmRoomCleaner interface {
+	AlarmRooms() []int
+	CleanRooms(ctx context.Context, rooms []int, repeat int) error
+}
+
 // Controller owns the main poll loop and state machine.
 type Controller struct {
 	alarm           AlarmSource
@@ -287,8 +292,16 @@ func (c *Controller) startVacuum(ctx context.Context, v VacuumCommander, status 
 		"battery", status.Battery,
 		"last_clean", lastClean,
 	)
-	if err := v.StartOrResume(ctx, status.State.IsPaused()); err != nil {
-		return false, fmt.Errorf("start: %w", err)
+	if cleaner, ok := v.(alarmRoomCleaner); ok && len(cleaner.AlarmRooms()) > 0 {
+		rooms := cleaner.AlarmRooms()
+		slog.Info("controller: starting room clean", "name", v.Name(), "rooms", rooms)
+		if err := cleaner.CleanRooms(ctx, rooms, 1); err != nil {
+			return false, fmt.Errorf("room clean: %w", err)
+		}
+	} else {
+		if err := v.StartOrResume(ctx, status.State.IsPaused()); err != nil {
+			return false, fmt.Errorf("start: %w", err)
+		}
 	}
 
 	if err := c.store.SetVacuumStartedByUs(v.Host(), true); err != nil {

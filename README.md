@@ -103,6 +103,7 @@ All configuration is via environment variables (or `.env`). Run `make fetch-toke
 | `ROBOROCK_0_TOKEN` | local: yes | — | First vacuum token (from `make fetch-tokens`) |
 | `ROBOROCK_0_NAME` | no | `vacuum-0` | Label for logs |
 | `ROBOROCK_0_BACKEND` | no | `ROBOROCK_CONTROL` | Per-vacuum backend: `roborock`, `xiaomi`, or `local` |
+| `ROBOROCK_0_ALARM_ROOMS` | no | — | Comma-separated room/segment IDs to clean when the alarm arms away; empty means full clean |
 | `ROBOROCK_N_HOST/DID/TOKEN/NAME` | no | — | Additional vacuums (N = 1, 2, …) |
 | `POLL_INTERVAL` | no | `60s` | How often to poll Verisure |
 | `CLEAN_COOLDOWN_ENABLED` | no | `true` | Set `false` to ignore recent clean history |
@@ -168,6 +169,8 @@ curl -X POST http://localhost:8080/robots/upstairs/start \
 ```
 
 Room IDs are the Roborock segment IDs from the robot's map. Classic/local miIO, Xiaomi cloud RPC, and Roborock-app V1 command paths use `app_segment_clean`; B01/Q10 models currently return an unsupported-command error until their room-clean DP mapping is confirmed.
+
+The same room IDs can be configured for alarm-triggered cleaning with `ROBOROCK_N_ALARM_ROOMS`. For example, `ROBOROCK_1_ALARM_ROOMS=16,18,19` makes robot 1 clean only those rooms when the alarm is armed away.
 
 ---
 

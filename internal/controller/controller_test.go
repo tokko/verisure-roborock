@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -58,6 +59,10 @@ type mockVacuum struct {
 	chargeCalled bool
 	chargeErr    error
 	statusCalls  int
+	alarmRooms   []int
+	cleanRooms   []int
+	cleanRepeat  int
+	cleanErr     error
 
 	// Per-call sequences: statusSeq[i] used on call i; falls back to status/statusErr after exhausted.
 	statusSeq []struct {
@@ -93,6 +98,12 @@ func (m *mockVacuum) Pause(_ context.Context) error {
 func (m *mockVacuum) Charge(_ context.Context) error {
 	m.chargeCalled = true
 	return m.chargeErr
+}
+func (m *mockVacuum) AlarmRooms() []int { return m.alarmRooms }
+func (m *mockVacuum) CleanRooms(_ context.Context, rooms []int, repeat int) error {
+	m.cleanRooms = append([]int(nil), rooms...)
+	m.cleanRepeat = repeat
+	return m.cleanErr
 }
 
 // --- Helpers ---
@@ -258,6 +269,29 @@ func TestMaybeStartVacuumCooldownDisabled(t *testing.T) {
 	assertBool(t, "StartOrResume called", v.startCalled, true)
 	if v.summaryCalls != 0 {
 		t.Fatalf("CleanSummary calls = %d, want 0 when cooldown disabled", v.summaryCalls)
+	}
+}
+
+func TestMaybeStartVacuumUsesConfiguredAlarmRooms(t *testing.T) {
+	v := &mockVacuum{
+		name:       "downstairs",
+		host:       "192.0.2.20",
+		status:     roborock.VacuumStatus{State: roborock.StateIdle, Battery: 80},
+		alarmRooms: []int{16, 18, 19},
+	}
+	c := New(&mockAlarm{}, []VacuumCommander{v}, newStore(t), time.Second, 24*time.Hour, false)
+
+	started, err := c.maybeStartVacuum(context.Background(), v)
+	if err != nil {
+		t.Fatalf("maybeStartVacuum: %v", err)
+	}
+	assertBool(t, "started", started, true)
+	assertBool(t, "StartOrResume not called", v.startCalled, false)
+	if !reflect.DeepEqual(v.cleanRooms, []int{16, 18, 19}) {
+		t.Fatalf("CleanRooms rooms = %#v, want [16 18 19]", v.cleanRooms)
+	}
+	if v.cleanRepeat != 1 {
+		t.Fatalf("CleanRooms repeat = %d, want 1", v.cleanRepeat)
 	}
 }
 

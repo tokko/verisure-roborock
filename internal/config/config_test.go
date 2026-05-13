@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -268,6 +269,25 @@ func TestLoadRoborockControl(t *testing.T) {
 		}
 	})
 
+	t.Run("per-vacuum alarm rooms are parsed", func(t *testing.T) {
+		withEnv(t, map[string]string{
+			"VERISURE_EMAIL":         "v@example.com",
+			"VERISURE_PASSWORD":      "secret",
+			"ROBOROCK_CONTROL":       "roborock",
+			"ROBOROCK_0_NAME":        "downstairs",
+			"ROBOROCK_0_ALARM_ROOMS": "16, 18,19",
+		})
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		want := []int{16, 18, 19}
+		if !reflect.DeepEqual(cfg.Vacuums[0].AlarmRooms, want) {
+			t.Fatalf("AlarmRooms = %#v, want %#v", cfg.Vacuums[0].AlarmRooms, want)
+		}
+	})
+
 	t.Run("local mode still requires host and token", func(t *testing.T) {
 		withEnv(t, map[string]string{
 			"VERISURE_EMAIL":    "v@example.com",
@@ -325,11 +345,13 @@ func withEnv(t *testing.T, vals map[string]string) {
 		"ROBOROCK_0_NAME",
 		"ROBOROCK_0_DID",
 		"ROBOROCK_0_BACKEND",
+		"ROBOROCK_0_ALARM_ROOMS",
 		"ROBOROCK_1_HOST",
 		"ROBOROCK_1_TOKEN",
 		"ROBOROCK_1_NAME",
 		"ROBOROCK_1_DID",
 		"ROBOROCK_1_BACKEND",
+		"ROBOROCK_1_ALARM_ROOMS",
 		"ROBOROCK_TIMEOUT",
 		"POLL_INTERVAL",
 		"CLEAN_COOLDOWN",
