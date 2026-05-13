@@ -80,6 +80,7 @@ func run() error {
 		AuthPath: cfg.RoborockAuthPath,
 		Timeout:  cfg.RoborockTimeout + 30*time.Second,
 	}
+	spacedRoborockRunner := roborock.NewSpacedRoborockAppRunner(&roborockRunner, roborock.DefaultRoborockAppCommandInterval)
 	for _, vc := range cfg.Vacuums {
 		switch vc.Backend {
 		case "local":
@@ -98,7 +99,7 @@ func run() error {
 			if selector == "" {
 				selector = vc.Host
 			}
-			rc, err := roborock.NewRoborockAppVacuum(vc.Name, vc.Host, selector, roborockRunner)
+			rc, err := roborock.NewRoborockAppVacuum(vc.Name, vc.Host, selector, spacedRoborockRunner)
 			if err != nil {
 				return fmt.Errorf("roborock app cloud client %s: %w", vc.Name, err)
 			}
@@ -192,7 +193,7 @@ func run() error {
 		Addr:              cfg.HTTPAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      10 * time.Second,
+		WriteTimeout:      2 * time.Minute,
 		IdleTimeout:       60 * time.Second,
 	}
 	go func() {

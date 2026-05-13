@@ -242,7 +242,7 @@ There is not a stable Xiaomi callback URL that this service can receive directly
 3. On transition to **DISARMED** or **ARMED_HOME**: for each vacuum it started, it sends `app_pause` then `app_charge` (return to dock)
 4. On restart: reconciles persisted state against current alarm and vacuum states before entering the poll loop — a vacuum will never be left running unattended after a crash
 
-If one vacuum starts but another fails transiently, the controller keeps retrying the pending vacuum while the alarm remains armed. Roborock cloud `app_start` also retries the common `request too frequency` / response `9002` rate-limit error with backoff.
+If one vacuum starts but another fails transiently, the controller keeps retrying the pending vacuum while the alarm remains armed. Roborock-app cloud control commands are serialized and spaced by 30 seconds to avoid the common `request too frequency` / response `9002` rate limit; if the cloud still returns that error, start/pause/dock commands retry with backoff.
 
 Default vacuum control uses the Roborock app cloud helper. Set `ROBOROCK_CONTROL=xiaomi` for Mi Home/Xiaomi Cloud devices or `ROBOROCK_CONTROL=local` to use the direct UDP miIO transport on your LAN.
 

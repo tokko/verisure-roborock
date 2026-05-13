@@ -10,6 +10,7 @@ import (
 
 type fakeRoborockAppRunner struct {
 	calls  []appRunnerCall
+	times  []time.Time
 	resp   map[string]json.RawMessage
 	err    error
 	errSeq []error
@@ -23,6 +24,7 @@ type appRunnerCall struct {
 
 func (f *fakeRoborockAppRunner) Run(_ context.Context, selector, command string, params any) (json.RawMessage, error) {
 	f.calls = append(f.calls, appRunnerCall{selector: selector, command: command, params: params})
+	f.times = append(f.times, time.Now())
 	i := len(f.calls) - 1
 	if i < len(f.errSeq) && f.errSeq[i] != nil {
 		return nil, f.errSeq[i]
@@ -147,5 +149,44 @@ func TestRoborockAppVacuumStartRetriesRateLimit(t *testing.T) {
 	}
 	if len(runner.calls) != 2 {
 		t.Fatalf("app_start calls = %d, want 2", len(runner.calls))
+	}
+}
+
+func TestSpacedRoborockAppRunnerSpacesControlCommands(t *testing.T) {
+	inner := &fakeRoborockAppRunner{resp: map[string]json.RawMessage{
+		"app_pause":  json.RawMessage(`["ok"]`),
+		"app_charge": json.RawMessage(`["ok"]`),
+	}}
+	runner := NewSpacedRoborockAppRunner(inner, 15*time.Millisecond)
+
+	if _, err := runner.Run(context.Background(), "downstairs", "app_pause", []any{}); err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	if _, err := runner.Run(context.Background(), "downstairs", "app_charge", []any{}); err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	if len(inner.times) != 2 {
+		t.Fatalf("calls = %d, want 2", len(inner.times))
+	}
+	if elapsed := inner.times[1].Sub(inner.times[0]); elapsed < 12*time.Millisecond {
+		t.Fatalf("control command spacing = %v, want at least 12ms", elapsed)
+	}
+}
+
+func TestSpacedRoborockAppRunnerDoesNotDelayReadCommands(t *testing.T) {
+	inner := &fakeRoborockAppRunner{resp: map[string]json.RawMessage{
+		"get_status": json.RawMessage(`[{"state":3,"battery":91}]`),
+		"app_start":  json.RawMessage(`["ok"]`),
+	}}
+	runner := NewSpacedRoborockAppRunner(inner, time.Hour)
+
+	if _, err := runner.Run(context.Background(), "downstairs", "get_status", nil); err != nil {
+		t.Fatalf("get_status: %v", err)
+	}
+	if _, err := runner.Run(context.Background(), "downstairs", "app_start", []any{}); err != nil {
+		t.Fatalf("app_start: %v", err)
+	}
+	if len(inner.calls) != 2 {
+		t.Fatalf("calls = %d, want 2", len(inner.calls))
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -35,6 +36,77 @@ type roborockAppVacuum struct {
 }
 
 var roborockAppRateLimitBackoff = []time.Duration{30 * time.Second, 90 * time.Second}
+
+const DefaultRoborockAppCommandInterval = 30 * time.Second
+
+// SpacedRoborockAppRunner serializes Roborock-app cloud calls and spaces them
+// out so pause/charge and multi-robot commands do not trip cloud rate limits.
+type SpacedRoborockAppRunner struct {
+	Runner      RoborockAppRunner
+	MinInterval time.Duration
+
+	mu      sync.Mutex
+	lastRun time.Time
+}
+
+func NewSpacedRoborockAppRunner(runner RoborockAppRunner, minInterval time.Duration) *SpacedRoborockAppRunner {
+	return &SpacedRoborockAppRunner{Runner: runner, MinInterval: minInterval}
+}
+
+func (r *SpacedRoborockAppRunner) Run(ctx context.Context, selector, command string, params any) (json.RawMessage, error) {
+	if r.Runner == nil {
+		return nil, fmt.Errorf("missing roborock app runner")
+	}
+	if err := r.waitForTurn(ctx, selector, command); err != nil {
+		return nil, err
+	}
+	return r.Runner.Run(ctx, selector, command, params)
+}
+
+func (r *SpacedRoborockAppRunner) waitForTurn(ctx context.Context, selector, command string) error {
+	if !isRoborockAppControlCommand(command) {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	interval := r.MinInterval
+	if interval <= 0 {
+		interval = DefaultRoborockAppCommandInterval
+	}
+	if !r.lastRun.IsZero() {
+		if wait := interval - time.Since(r.lastRun); wait > 0 {
+			slog.Info("roborock app cloud: waiting for request slot",
+				"selector", selector,
+				"command", command,
+				"wait", wait.Round(time.Second),
+			)
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	r.lastRun = time.Now()
+	return nil
+}
+
+func isRoborockAppControlCommand(command string) bool {
+	switch command {
+	case "app_start", "app_resume", "app_pause", "app_charge", "app_stop", "app_segment_clean":
+		return true
+	default:
+		return false
+	}
+}
 
 func NewRoborockAppVacuum(name, storeKey, selector string, runner RoborockAppRunner) (*roborockAppVacuum, error) {
 	if selector == "" {
@@ -100,7 +172,7 @@ func (c *roborockAppVacuum) CleanRooms(ctx context.Context, rooms []int, repeat 
 }
 
 func (c *roborockAppVacuum) Pause(ctx context.Context) error {
-	if err := c.command(ctx, "app_pause"); err != nil {
+	if err := c.commandWithRateLimitRetry(ctx, "app_pause"); err != nil {
 		return err
 	}
 	slog.Info("roborock app cloud: paused", "name", c.name)
@@ -108,7 +180,7 @@ func (c *roborockAppVacuum) Pause(ctx context.Context) error {
 }
 
 func (c *roborockAppVacuum) Charge(ctx context.Context) error {
-	if err := c.command(ctx, "app_charge"); err != nil {
+	if err := c.commandWithRateLimitRetry(ctx, "app_charge"); err != nil {
 		return err
 	}
 	slog.Info("roborock app cloud: returning to dock", "name", c.name)
