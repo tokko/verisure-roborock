@@ -11,9 +11,11 @@ import (
 
 // VacuumConfig holds per-device Roborock configuration.
 type VacuumConfig struct {
-	Host  string
-	Token string // 32-char hex device token
-	Name  string // human-readable label for logs
+	Host    string
+	Token   string // 32-char hex device token
+	Name    string // human-readable label for logs
+	DID     string // Xiaomi cloud device ID; optional when host/token can match
+	Backend string // "roborock", "xiaomi", or "local"
 }
 
 // Config holds all runtime configuration.
@@ -28,19 +30,26 @@ type Config struct {
 	// Roborock account (for 'make fetch-tokens' — may differ from Verisure)
 	RoborockEmail    string // falls back to XiaomiEmail then VerisureEmail
 	RoborockPassword string // falls back to XiaomiPassword then VerisurePassword
+	RoborockControl  string // "roborock"/"cloud" (Roborock app), "xiaomi", "mixed", or "local"
+	RoborockAuthPath string // cached Roborock app auth for cloud control
+	RoborockPython   string // Python executable for the Roborock app helper
+	RoborockHelper   string // helper script path for Roborock app cloud control
 
 	// Xiaomi cloud (alternative backend for Mi Home app users)
 	XiaomiEmail    string
 	XiaomiPassword string
 	XiaomiCountry  string // EU=de, US=us, etc.
+	XiaomiAuthPath string
+	XiaomiAuth     XiaomiAuthConfig
 
 	// Roborock vacuums (one or more)
 	Vacuums []VacuumConfig
 
 	// Timing
-	PollInterval    time.Duration
-	CleanCooldown   time.Duration
-	RoborockTimeout time.Duration
+	PollInterval         time.Duration
+	CleanCooldown        time.Duration
+	CleanCooldownEnabled bool
+	RoborockTimeout      time.Duration
 
 	// Persistence
 	StorePath string
@@ -83,6 +92,18 @@ func Load() (*Config, error) {
 		}
 		return d
 	}
+	boolean := func(key string, def bool) bool {
+		s := os.Getenv(key)
+		if s == "" {
+			return def
+		}
+		v, err := strconv.ParseBool(s)
+		if err != nil {
+			missing = append(missing, key+" (invalid bool: "+err.Error()+")")
+			return def
+		}
+		return v
+	}
 
 	verisureEmail := require("VERISURE_EMAIL")
 	verisurePassword := require("VERISURE_PASSWORD")
@@ -97,18 +118,29 @@ func Load() (*Config, error) {
 		// Roborock account — falls back through Xiaomi then Verisure credentials.
 		RoborockEmail:    optional("ROBOROCK_EMAIL", optional("XIAOMI_EMAIL", verisureEmail)),
 		RoborockPassword: optional("ROBOROCK_PASSWORD", optional("XIAOMI_PASSWORD", verisurePassword)),
+		RoborockControl:  normalizeBackend(optional("ROBOROCK_CONTROL", "roborock")),
+		RoborockAuthPath: optional("ROBOROCK_AUTH_PATH", "./roborock-auth.json"),
+		RoborockPython:   optional("ROBOROCK_PYTHON", "python3"),
+		RoborockHelper:   optional("ROBOROCK_HELPER", "./scripts/roborock_cloud.py"),
 
-		XiaomiEmail:    optional("XIAOMI_EMAIL", verisureEmail),
-		XiaomiPassword: optional("XIAOMI_PASSWORD", verisurePassword),
+		XiaomiEmail:    optional("XIAOMI_EMAIL", optional("ROBOROCK_EMAIL", verisureEmail)),
+		XiaomiPassword: optional("XIAOMI_PASSWORD", optional("ROBOROCK_PASSWORD", verisurePassword)),
 		XiaomiCountry:  optional("XIAOMI_COUNTRY", "de"), // EU server
+		XiaomiAuthPath: optional("XIAOMI_AUTH_PATH", "./xiaomi-auth.json"),
+		XiaomiAuth: XiaomiAuthConfig{
+			UserID:       optional("XIAOMI_USER_ID", ""),
+			SSecurity:    optional("XIAOMI_SSECURITY", ""),
+			ServiceToken: optional("XIAOMI_SERVICE_TOKEN", ""),
+		},
 
-		PollInterval:    duration("POLL_INTERVAL", 60*time.Second),
-		CleanCooldown:   duration("CLEAN_COOLDOWN", 24*time.Hour),
-		RoborockTimeout: duration("ROBOROCK_TIMEOUT", 10*time.Second),
-		StorePath: optional("STORE_PATH", "./state.json"),
-		HTTPAddr:  optional("HTTP_ADDR", ":8080"),
-		LogLevel:  optional("LOG_LEVEL", "info"),
-		MFASecret: optional("MFA_SECRET", ""),
+		PollInterval:         duration("POLL_INTERVAL", 60*time.Second),
+		CleanCooldown:        duration("CLEAN_COOLDOWN", 24*time.Hour),
+		CleanCooldownEnabled: boolean("CLEAN_COOLDOWN_ENABLED", true),
+		RoborockTimeout:      duration("ROBOROCK_TIMEOUT", 10*time.Second),
+		StorePath:            optional("STORE_PATH", "./state.json"),
+		HTTPAddr:             optional("HTTP_ADDR", ":8080"),
+		LogLevel:             optional("LOG_LEVEL", "info"),
+		MFASecret:            optional("MFA_SECRET", ""),
 	}
 
 	// Load vacuums: ROBOROCK_0_HOST, ROBOROCK_0_TOKEN, ROBOROCK_0_NAME, ...
@@ -116,26 +148,59 @@ func Load() (*Config, error) {
 	for i := 0; ; i++ {
 		prefix := fmt.Sprintf("ROBOROCK_%d_", i)
 		host := os.Getenv(prefix + "HOST")
-		if host == "" {
+		token := os.Getenv(prefix + "TOKEN")
+		name := os.Getenv(prefix + "NAME")
+		did := os.Getenv(prefix + "DID")
+		backend := normalizeBackend(os.Getenv(prefix + "BACKEND"))
+		if backend == "" {
+			backend = cfg.RoborockControl
+			if backend == "mixed" {
+				backend = "roborock"
+			}
+		}
+		if host == "" && token == "" && name == "" && did == "" && os.Getenv(prefix+"BACKEND") == "" {
 			break
 		}
-		token := os.Getenv(prefix + "TOKEN")
-		if token == "" {
+		if backend == "local" && host == "" {
+			missing = append(missing, prefix+"HOST")
+		}
+		if backend == "local" && token == "" {
 			missing = append(missing, prefix+"TOKEN")
 		}
-		name := os.Getenv(prefix + "NAME")
+		if backend == "xiaomi" && host == "" && token == "" && did == "" && name == "" {
+			missing = append(missing, prefix+"DID or "+prefix+"HOST or "+prefix+"TOKEN")
+		}
+		if backend == "roborock" && host == "" && did == "" && name == "" {
+			missing = append(missing, prefix+"NAME or "+prefix+"HOST or "+prefix+"DID")
+		}
+		if backend != "local" && backend != "roborock" && backend != "xiaomi" {
+			missing = append(missing, prefix+"BACKEND (must be roborock, xiaomi, or local)")
+		}
 		if name == "" {
 			name = fmt.Sprintf("vacuum-%d", i)
 		}
+		if host == "" {
+			if did != "" {
+				host = did
+			} else if backend == "roborock" {
+				host = name
+			}
+		}
 		cfg.Vacuums = append(cfg.Vacuums, VacuumConfig{
-			Host:  host,
-			Token: token,
-			Name:  name,
+			Host:    host,
+			Token:   token,
+			Name:    name,
+			DID:     did,
+			Backend: backend,
 		})
 	}
 
 	if len(cfg.Vacuums) == 0 {
-		missing = append(missing, "ROBOROCK_0_HOST (at least one vacuum required; run 'make fetch-tokens' to discover)")
+		missing = append(missing, "ROBOROCK_0_NAME or ROBOROCK_0_HOST or ROBOROCK_0_DID (at least one vacuum required)")
+	}
+
+	if cfg.RoborockControl != "roborock" && cfg.RoborockControl != "xiaomi" && cfg.RoborockControl != "mixed" && cfg.RoborockControl != "local" {
+		missing = append(missing, "ROBOROCK_CONTROL (must be roborock, xiaomi, mixed, cloud, or local)")
 	}
 
 	// Guard against duplicate vacuum hosts (would cause a store key collision).
@@ -152,6 +217,24 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+type XiaomiAuthConfig struct {
+	UserID       string
+	SSecurity    string
+	ServiceToken string
+}
+
+func (a XiaomiAuthConfig) Complete() bool {
+	return a.UserID != "" && a.SSecurity != "" && a.ServiceToken != ""
+}
+
+func normalizeBackend(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "cloud" {
+		return "roborock"
+	}
+	return v
 }
 
 // LoadDotEnv reads key=value pairs from path into the environment.

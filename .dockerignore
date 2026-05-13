@@ -1,0 +1,8 @@
+.git
+.gocache
+dist
+probe.exe
+state.json
+state.json.tmp
+xiaomi-auth.json
+*.tmp

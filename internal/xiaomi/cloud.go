@@ -1,14 +1,13 @@
-// Package xiaomi implements a minimal Xiaomi cloud API client for
-// fetching Roborock device tokens. It is used only by the fetch-tokens
-// command — not by the main server (which uses local miIO).
+// Package xiaomi implements a minimal Xiaomi cloud API client for fetching
+// Roborock device tokens and sending cloud RPC commands.
 package xiaomi
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/rc4"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -18,6 +17,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -26,10 +26,26 @@ import (
 const (
 	serviceURL = "https://account.xiaomi.com/pass/serviceLogin"
 	authURL    = "https://account.xiaomi.com/pass/serviceLoginAuth2"
-	// Country-specific device list URL. %s = country code (de, us, sg, cn, ...).
-	// EU users typically use "de".
-	deviceListURL = "https://%sapi.io.mi.com/app/home/device_list"
 )
+
+type loginInfo struct {
+	Sign         string
+	QS           string
+	Callback     string
+	ServiceParam string
+}
+
+// Auth holds the reusable Xiaomi Cloud credentials needed for signed API calls.
+type Auth struct {
+	UserID       string    `json:"user_id"`
+	SSecurity    string    `json:"ssecurity"`
+	ServiceToken string    `json:"service_token"`
+	UpdatedAt    time.Time `json:"updated_at,omitempty"`
+}
+
+func (a Auth) Valid() bool {
+	return a.UserID != "" && a.SSecurity != "" && a.ServiceToken != ""
+}
 
 // Device holds the relevant fields for a discovered Xiaomi device.
 type Device struct {
@@ -60,6 +76,110 @@ type CloudClient struct {
 	jar  *cookiejar.Jar
 }
 
+// RPC sends a miIO JSON-RPC command through Xiaomi Cloud's /home/rpc/{did}
+// endpoint and returns the JSON-RPC result field.
+func (c *CloudClient) RPC(ctx context.Context, did, method string, id uint32, params any) (json.RawMessage, error) {
+	if c.serviceToken == "" || c.ssecurity == "" || c.userId == "" {
+		return nil, fmt.Errorf("not authenticated - call Login first")
+	}
+	raw, err := c.request(ctx, "/home/rpc/"+did, map[string]any{
+		"id":     id,
+		"method": method,
+		"params": params,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var envelope struct {
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Result  json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, fmt.Errorf("parse rpc envelope: %w (body: %.200s)", err, raw)
+	}
+	if envelope.Code != 0 {
+		return nil, fmt.Errorf("rpc error %d: %s", envelope.Code, envelope.Message)
+	}
+	if len(envelope.Result) == 0 || string(envelope.Result) == "null" {
+		return nil, fmt.Errorf("rpc response missing result")
+	}
+
+	result := envelope.Result
+	var quoted string
+	if err := json.Unmarshal(envelope.Result, &quoted); err == nil {
+		result = []byte(quoted)
+	}
+
+	var rpc struct {
+		ID     uint32          `json:"id"`
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(result, &rpc); err == nil && (len(rpc.Result) > 0 || rpc.Error != nil) {
+		if rpc.Error != nil {
+			return nil, fmt.Errorf("device rpc error %d: %s", rpc.Error.Code, rpc.Error.Message)
+		}
+		return rpc.Result, nil
+	}
+
+	return result, nil
+}
+
+func (c *CloudClient) SetAuth(auth Auth) error {
+	if !auth.Valid() {
+		return fmt.Errorf("xiaomi auth is incomplete")
+	}
+	c.userId = auth.UserID
+	c.ssecurity = auth.SSecurity
+	c.serviceToken = auth.ServiceToken
+	return nil
+}
+
+func (c *CloudClient) Auth() Auth {
+	return Auth{
+		UserID:       c.userId,
+		SSecurity:    c.ssecurity,
+		ServiceToken: c.serviceToken,
+		UpdatedAt:    time.Now().UTC(),
+	}
+}
+
+func LoadAuth(path string) (Auth, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Auth{}, err
+	}
+	var auth Auth
+	if err := json.Unmarshal(data, &auth); err != nil {
+		return Auth{}, err
+	}
+	if !auth.Valid() {
+		return Auth{}, fmt.Errorf("xiaomi auth file %s is incomplete", path)
+	}
+	return auth, nil
+}
+
+func SaveAuth(path string, auth Auth) error {
+	if !auth.Valid() {
+		return fmt.Errorf("xiaomi auth is incomplete")
+	}
+	auth.UpdatedAt = time.Now().UTC()
+	data, err := json.MarshalIndent(auth, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 // NewCloudClient creates a client for the given country (e.g. "de" for EU).
 func NewCloudClient(email, password, country string) (*CloudClient, error) {
 	jar, err := cookiejar.New(nil)
@@ -67,24 +187,24 @@ func NewCloudClient(email, password, country string) (*CloudClient, error) {
 		return nil, err
 	}
 	return &CloudClient{
-		email:   email,
+		email:    email,
 		password: password,
-		country: country,
-		jar:     jar,
-		http:    &http.Client{Jar: jar, Timeout: 30 * time.Second},
+		country:  country,
+		jar:      jar,
+		http:     &http.Client{Jar: jar, Timeout: 30 * time.Second},
 	}, nil
 }
 
 // Login authenticates with the Xiaomi account service.
 func (c *CloudClient) Login(ctx context.Context) error {
 	// Step 1: GET the login page to retrieve the _sign parameter.
-	sign, err := c.fetchSign(ctx)
+	info, err := c.fetchLoginInfo(ctx)
 	if err != nil {
-		return fmt.Errorf("fetch sign: %w", err)
+		return fmt.Errorf("fetch login info: %w", err)
 	}
 
 	// Step 2: POST credentials to get ssecurity + userId + location.
-	location, err := c.postCredentials(ctx, sign)
+	location, err := c.postCredentials(ctx, info)
 	if err != nil {
 		return fmt.Errorf("post credentials: %w", err)
 	}
@@ -97,42 +217,54 @@ func (c *CloudClient) Login(ctx context.Context) error {
 	return nil
 }
 
-// fetchSign GETs the serviceLogin page and extracts the _sign field.
-func (c *CloudClient) fetchSign(ctx context.Context) (string, error) {
+// fetchLoginInfo GETs the serviceLogin page and extracts fields required by serviceLoginAuth2.
+func (c *CloudClient) fetchLoginInfo(ctx context.Context) (loginInfo, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serviceURL, nil)
 	if err != nil {
-		return "", err
+		return loginInfo{}, err
 	}
 	q := req.URL.Query()
 	q.Set("sid", "xiaomiio")
 	q.Set("_json", "true")
+	q.Set("callback", "https://sts.api.io.mi.com/sts")
 	req.URL.RawQuery = q.Encode()
 	c.setCommonHeaders(req)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", err
+		return loginInfo{}, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return loginInfo{}, err
 	}
 	// Response is prefixed with "&&&START&&&" — strip it.
 	body = stripPrefix(body)
 
 	var result struct {
-		Sign string `json:"_sign"`
+		Sign         string `json:"_sign"`
+		QS           string `json:"qs"`
+		Callback     string `json:"callback"`
+		ServiceParam string `json:"serviceParam"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("parse sign response: %w", err)
+		return loginInfo{}, fmt.Errorf("parse sign response: %w", err)
 	}
-	return result.Sign, nil
+	if result.Sign == "" {
+		return loginInfo{}, fmt.Errorf("login response missing _sign")
+	}
+	return loginInfo{
+		Sign:         result.Sign,
+		QS:           firstNonEmpty(result.QS, "?sid=xiaomiio&_json=true"),
+		Callback:     firstNonEmpty(result.Callback, "https://sts.api.io.mi.com/sts"),
+		ServiceParam: firstNonEmpty(result.ServiceParam, `{"checkSafePhone":false}`),
+	}, nil
 }
 
 // postCredentials submits email + hashed password and returns the location URL.
-func (c *CloudClient) postCredentials(ctx context.Context, sign string) (string, error) {
+func (c *CloudClient) postCredentials(ctx context.Context, info loginInfo) (string, error) {
 	// Password is transmitted as uppercase MD5 hash.
 	h := md5.Sum([]byte(c.password))
 	hash := strings.ToUpper(fmt.Sprintf("%x", h))
@@ -141,9 +273,11 @@ func (c *CloudClient) postCredentials(ctx context.Context, sign string) (string,
 	form.Set("_json", "true")
 	form.Set("user", c.email)
 	form.Set("hash", hash)
-	form.Set("_sign", sign)
+	form.Set("_sign", info.Sign)
 	form.Set("sid", "xiaomiio")
-	form.Set("serviceParam", `{"checkSafePhone":false}`)
+	form.Set("qs", info.QS)
+	form.Set("callback", info.Callback)
+	form.Set("serviceParam", info.ServiceParam)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, authURL, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -215,20 +349,34 @@ func (c *CloudClient) fetchServiceToken(ctx context.Context, location string) er
 
 // Devices fetches the full device list and returns Roborock devices with decrypted tokens.
 func (c *CloudClient) Devices(ctx context.Context) ([]Device, error) {
+	raw, err := c.request(ctx, "/home/device_list", map[string]any{
+		"getVirtualModel": true,
+		"getHuamiDevices": 0,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parseDeviceList(raw)
+}
+
+func (c *CloudClient) request(ctx context.Context, path string, data any) (json.RawMessage, error) {
 	nonce := genNonce()
 	signedNonce := signNonce(c.ssecurity, nonce)
 
-	data := `{"getVirtualModel":true,"getHuamiDevices":0}`
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
 
 	// Build the form fields, then sign and encrypt them.
 	fields := map[string]string{
-		"data": data,
+		"data": string(payload),
 	}
 	// rc4_hash__ is the signature of the unencrypted fields.
-	fields["rc4_hash__"] = signData("/home/device_list", fields, signedNonce)
+	fields["rc4_hash__"] = signData(path, fields, signedNonce)
 
 	// Encrypt each field value with RC4.
-	encrypted := make(map[string]string, len(fields))
+	encrypted := make(map[string]string, len(fields)+3)
 	for k, v := range fields {
 		enc, err := encryptRC4(signedNonce, v)
 		if err != nil {
@@ -238,7 +386,7 @@ func (c *CloudClient) Devices(ctx context.Context) ([]Device, error) {
 	}
 
 	// Add the outer signature (of the encrypted values).
-	encrypted["signature"] = signData("/home/device_list", encrypted, signedNonce)
+	encrypted["signature"] = signData(path, encrypted, signedNonce)
 	encrypted["ssecurity"] = c.ssecurity
 	encrypted["_nonce"] = nonce
 
@@ -247,12 +395,13 @@ func (c *CloudClient) Devices(ctx context.Context) ([]Device, error) {
 		form.Set(k, v)
 	}
 
-	apiURL := fmt.Sprintf(deviceListURL, c.country)
+	apiURL := fmt.Sprintf("https://%s/app%s", apiHost(c.country), path)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("MIOT-ENCRYPT-ALGORITHM", "ENCRYPT-RC4")
 	req.Header.Set("x-xiaomi-protocal-flag-cli", "PROTOCAL-HTTP2")
 	req.Header.Set("mishop-client-id", "180100041079")
 	req.Header.Set("User-Agent", "APP/com.xiaomi.mihome APPV/6.0.103")
@@ -273,6 +422,9 @@ func (c *CloudClient) Devices(ctx context.Context) ([]Device, error) {
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, body)
+	}
 
 	// Decrypt the response body with RC4.
 	decrypted, err := decryptRC4(signedNonce, string(body))
@@ -281,6 +433,10 @@ func (c *CloudClient) Devices(ctx context.Context) ([]Device, error) {
 		decrypted = string(body)
 	}
 
+	return json.RawMessage(decrypted), nil
+}
+
+func parseDeviceList(raw json.RawMessage) ([]Device, error) {
 	var result struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
@@ -288,23 +444,22 @@ func (c *CloudClient) Devices(ctx context.Context) ([]Device, error) {
 			List []Device `json:"list"`
 		} `json:"result"`
 	}
-	if err := json.Unmarshal([]byte(decrypted), &result); err != nil {
-		return nil, fmt.Errorf("parse device list: %w (body: %.200s)", err, decrypted)
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("parse device list: %w (body: %.200s)", err, raw)
 	}
 	if result.Code != 0 {
 		return nil, fmt.Errorf("device list error %d: %s", result.Code, result.Message)
 	}
-
 	return result.Result.List, nil
 }
 
 // --- Crypto helpers ---
 
-// genNonce generates a miCloud nonce: base64(4 random bytes + 4-byte big-endian minute-timestamp).
+// genNonce generates a miCloud nonce: base64(8 random bytes + 4-byte big-endian minute-timestamp).
 func genNonce() string {
-	var b [8]byte
-	rand.Read(b[:4])
-	binary.BigEndian.PutUint32(b[4:], uint32(time.Now().UnixMilli()/60000))
+	var b [12]byte
+	rand.Read(b[:8])
+	binary.BigEndian.PutUint32(b[8:], uint32(time.Now().UnixMilli()/60000))
 	return base64.StdEncoding.EncodeToString(b[:])
 }
 
@@ -316,7 +471,7 @@ func signNonce(ssecurity, nonce string) string {
 	return base64.StdEncoding.EncodeToString(h[:])
 }
 
-// signData computes an HMAC-SHA256 signature over sorted key=value pairs.
+// signData computes Xiaomi's RC4 request signature over sorted key=value pairs.
 func signData(uri string, params map[string]string, signedNonce string) string {
 	// Sort keys for deterministic output.
 	keys := make([]string, 0, len(params))
@@ -325,17 +480,15 @@ func signData(uri string, params map[string]string, signedNonce string) string {
 	}
 	sort.Strings(keys)
 
-	parts := []string{uri}
+	parts := []string{"POST", uri}
 	for _, k := range keys {
 		parts = append(parts, fmt.Sprintf("%s=%s", k, params[k]))
 	}
 	parts = append(parts, signedNonce)
 	msg := strings.Join(parts, "&")
 
-	key, _ := base64.StdEncoding.DecodeString(signedNonce)
-	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte(msg))
-	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	sum := sha1.Sum([]byte(msg))
+	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
 // encryptRC4 encrypts a payload string with RC4, skipping the first 1024 bytes of keystream.
@@ -386,4 +539,20 @@ func stripPrefix(b []byte) []byte {
 func (c *CloudClient) setCommonHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", "APP/com.xiaomi.mihome APPV/6.0.103 iosPassportSDK/3.9.0 iOS/14.4 miHSTS")
 	req.Header.Set("Accept", "application/json")
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func apiHost(country string) string {
+	if country == "" || country == "cn" {
+		return "api.io.mi.com"
+	}
+	return country + ".api.io.mi.com"
 }

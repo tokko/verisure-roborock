@@ -129,9 +129,23 @@ func fetchViaXiaomi(ctx context.Context, email, password, country string) ([]tok
 	if err != nil {
 		return nil, err
 	}
-	fmt.Fprintf(os.Stderr, "Logging into Xiaomi cloud (%s)...\n", country)
-	if err := client.Login(ctx); err != nil {
-		return nil, err
+	authPath := os.Getenv("XIAOMI_AUTH_PATH")
+	if authPath != "" {
+		auth, err := xiaomi.LoadAuth(authPath)
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "Using cached Xiaomi auth from %s...\n", authPath)
+			if err := client.SetAuth(auth); err != nil {
+				return nil, err
+			}
+		} else if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Cached Xiaomi auth unavailable: %v\n", err)
+		}
+	}
+	if !client.Auth().Valid() {
+		fmt.Fprintf(os.Stderr, "Logging into Xiaomi cloud (%s)...\n", country)
+		if err := client.Login(ctx); err != nil {
+			return nil, err
+		}
 	}
 	fmt.Fprintln(os.Stderr, "Fetching devices...")
 
@@ -149,6 +163,7 @@ func fetchViaXiaomi(ctx context.Context, email, password, country string) ([]tok
 			Name:  d.Name,
 			IP:    d.LocalIP,
 			Token: d.Token,
+			DID:   d.DID,
 		})
 	}
 	return out, nil
@@ -158,6 +173,7 @@ type tokenDevice struct {
 	Name  string
 	IP    string
 	Token string
+	DID   string
 }
 
 func printEnv(devices []tokenDevice) {
@@ -181,6 +197,9 @@ func printEnv(devices []tokenDevice) {
 			token = "<not available>"
 		}
 		fmt.Printf("ROBOROCK_%d_HOST=%s\n", i, ip)
+		if d.DID != "" {
+			fmt.Printf("ROBOROCK_%d_DID=%s\n", i, d.DID)
+		}
 		fmt.Printf("ROBOROCK_%d_TOKEN=%s\n", i, token)
 		fmt.Printf("ROBOROCK_%d_NAME=%s\n", i, name)
 		if i < len(devices)-1 {

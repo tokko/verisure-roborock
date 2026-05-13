@@ -18,6 +18,7 @@ import (
 	"verisure-roborock/internal/roborock"
 	"verisure-roborock/internal/store"
 	"verisure-roborock/internal/verisure"
+	"verisure-roborock/internal/xiaomi"
 )
 
 var version = "dev"
@@ -65,21 +66,72 @@ func run() error {
 		verisureClient.SetGIID(cfg.VerisureGIID)
 	}
 
-	// Build Roborock clients.
-	var vacuums []controller.VacuumCommander
-	for _, vc := range cfg.Vacuums {
-		rc, err := roborock.NewClient(vc.Name, vc.Host, vc.Token, cfg.RoborockTimeout)
-		if err != nil {
-			return fmt.Errorf("roborock client %s: %w", vc.Name, err)
-		}
-		vacuums = append(vacuums, rc)
-	}
-
-	ctrl := controller.New(verisureClient, vacuums, st, cfg.PollInterval, cfg.CleanCooldown)
-
 	// Root context, cancelled on SIGINT/SIGTERM.
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	// Build Roborock clients.
+	var vacuums []controller.VacuumCommander
+	var xiaomiVacuums []config.VacuumConfig
+	roborockRunner := roborock.PythonRoborockAppRunner{
+		Python:   cfg.RoborockPython,
+		Script:   cfg.RoborockHelper,
+		Email:    cfg.RoborockEmail,
+		AuthPath: cfg.RoborockAuthPath,
+		Timeout:  cfg.RoborockTimeout + 30*time.Second,
+	}
+	for _, vc := range cfg.Vacuums {
+		switch vc.Backend {
+		case "local":
+			rc, err := roborock.NewClient(vc.Name, vc.Host, vc.Token, cfg.RoborockTimeout)
+			if err != nil {
+				return fmt.Errorf("roborock client %s: %w", vc.Name, err)
+			}
+			vacuums = append(vacuums, rc)
+		case "xiaomi":
+			xiaomiVacuums = append(xiaomiVacuums, vc)
+		case "roborock":
+			selector := vc.DID
+			if selector == "" {
+				selector = vc.Name
+			}
+			if selector == "" {
+				selector = vc.Host
+			}
+			rc, err := roborock.NewRoborockAppVacuum(vc.Name, vc.Host, selector, roborockRunner)
+			if err != nil {
+				return fmt.Errorf("roborock app cloud client %s: %w", vc.Name, err)
+			}
+			vacuums = append(vacuums, rc)
+		default:
+			return fmt.Errorf("unsupported roborock backend %q for %s", vc.Backend, vc.Name)
+		}
+	}
+	if len(xiaomiVacuums) > 0 {
+		cloud, err := xiaomi.NewCloudClient(cfg.XiaomiEmail, cfg.XiaomiPassword, cfg.XiaomiCountry)
+		if err != nil {
+			return fmt.Errorf("xiaomi cloud client: %w", err)
+		}
+		if err := authenticateXiaomi(ctx, cfg, cloud); err != nil {
+			return err
+		}
+		cloudVacuums, err := roborock.NewCloudVacuums(ctx, xiaomiVacuums, cloud)
+		if err != nil {
+			loginErr := loginAndCacheXiaomi(ctx, cfg, cloud)
+			if loginErr != nil {
+				return fmt.Errorf("roborock cloud clients: %w (refresh auth also failed: %v)", err, loginErr)
+			}
+			cloudVacuums, err = roborock.NewCloudVacuums(ctx, xiaomiVacuums, cloud)
+			if err != nil {
+				return fmt.Errorf("roborock cloud clients: %w", err)
+			}
+		}
+		for _, rc := range cloudVacuums {
+			vacuums = append(vacuums, rc)
+		}
+	}
+
+	ctrl := controller.New(verisureClient, vacuums, st, cfg.PollInterval, cfg.CleanCooldown, cfg.CleanCooldownEnabled)
 
 	// HTTP status/health server.
 	mux := http.NewServeMux()
@@ -89,6 +141,10 @@ func run() error {
 	})
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		st := st.Get()
+		alarmState := st.AlarmState
+		if alarmState == "" {
+			alarmState = string(ctrl.AlarmState())
+		}
 		type vacuumStatus struct {
 			Name        string `json:"name"`
 			Host        string `json:"host"`
@@ -106,7 +162,7 @@ func run() error {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"control_state": ctrl.State().String(),
-			"alarm_state":   st.AlarmState,
+			"alarm_state":   alarmState,
 			"vacuums":       vs,
 		})
 	})
@@ -188,5 +244,47 @@ func run() error {
 	srv.Shutdown(shutdownCtx)
 
 	slog.Info("shutdown complete")
+	return nil
+}
+
+func authenticateXiaomi(ctx context.Context, cfg *config.Config, cloud *xiaomi.CloudClient) error {
+	if cfg.XiaomiAuth.Complete() {
+		if err := cloud.SetAuth(xiaomi.Auth{
+			UserID:       cfg.XiaomiAuth.UserID,
+			SSecurity:    cfg.XiaomiAuth.SSecurity,
+			ServiceToken: cfg.XiaomiAuth.ServiceToken,
+		}); err != nil {
+			return fmt.Errorf("xiaomi auth from environment: %w", err)
+		}
+		if err := xiaomi.SaveAuth(cfg.XiaomiAuthPath, cloud.Auth()); err != nil {
+			slog.Warn("xiaomi: could not persist environment auth", "err", err)
+		}
+		slog.Info("xiaomi: using auth from environment")
+		return nil
+	}
+
+	auth, err := xiaomi.LoadAuth(cfg.XiaomiAuthPath)
+	if err == nil {
+		if err := cloud.SetAuth(auth); err != nil {
+			return fmt.Errorf("xiaomi cached auth: %w", err)
+		}
+		slog.Info("xiaomi: using cached auth", "path", cfg.XiaomiAuthPath)
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		slog.Warn("xiaomi: cached auth unavailable", "path", cfg.XiaomiAuthPath, "err", err)
+	}
+
+	return loginAndCacheXiaomi(ctx, cfg, cloud)
+}
+
+func loginAndCacheXiaomi(ctx context.Context, cfg *config.Config, cloud *xiaomi.CloudClient) error {
+	if err := cloud.Login(ctx); err != nil {
+		return fmt.Errorf("xiaomi cloud login: %w", err)
+	}
+	if err := xiaomi.SaveAuth(cfg.XiaomiAuthPath, cloud.Auth()); err != nil {
+		return fmt.Errorf("save xiaomi auth: %w", err)
+	}
+	slog.Info("xiaomi: login succeeded and auth cached", "path", cfg.XiaomiAuthPath)
 	return nil
 }

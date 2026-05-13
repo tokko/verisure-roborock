@@ -31,7 +31,7 @@ A single Go binary that polls the Verisure home alarm and automates all configur
 ┌──────────────────┐    ┌───────────────────────────────────┐
 │ verisure.Client  │    │       []roborock.Client           │
 │ Session auth     │    │ One per configured vacuum         │
-│ GET arm state    │    │ UDP miIO, commands, status        │
+│ GET arm state    │    │ Xiaomi Cloud RPC or UDP miIO      │
 │ Auto re-login    │    └───────────────────────────────────┘
 └──────────────────┘                  │
                                       ▼
@@ -63,6 +63,7 @@ verisure-roborock/
 │   │   └── types.go             # ArmState enum, response structs
 │   ├── roborock/
 │   │   ├── client.go            # UDP socket, high-level commands
+│   │   ├── cloud_client.go      # Xiaomi Cloud RPC high-level commands
 │   │   ├── miio.go              # binary frame encode/decode, AES, checksum
 │   │   └── types.go             # VacuumState enum, status/command types
 │   ├── controller/
@@ -192,6 +193,10 @@ type State struct {
 GET /installation/{giid}/armstate
 → {"data": {"state": "ARMED_AWAY" | "ARMED_HOME" | "DISARMED", ...}}
 ```
+
+### Roborock Control
+
+Default runtime control uses Xiaomi Cloud RPC (`/home/rpc/{did}`) and the same miIO method names as local control. The local UDP miIO transport remains available with `ROBOROCK_CONTROL=local`.
 
 ### Roborock (local miIO, UDP port 54321)
 
@@ -449,8 +454,10 @@ func (s *Store) SetVacuumLastClean(host string, t time.Time) error
 | `ROBOROCK_0_NAME` | no | `vacuum-0` | Log label |
 | `ROBOROCK_N_HOST/TOKEN/NAME` | no | — | Additional vacuums (N=1,2,...) |
 | `POLL_INTERVAL` | no | `60s` | Go duration string |
+| `CLEAN_COOLDOWN_ENABLED` | no | `true` | Set `false` to start whenever alarm arms away |
 | `CLEAN_COOLDOWN` | no | `24h` | Min time between auto-cleans |
-| `ROBOROCK_TIMEOUT` | no | `10s` | Per-UDP-command deadline |
+| `ROBOROCK_CONTROL` | no | `cloud` | `cloud` for Xiaomi Cloud RPC, `local` for UDP miIO |
+| `ROBOROCK_TIMEOUT` | no | `10s` | Per-UDP-command deadline in local mode |
 | `STORE_PATH` | no | `./state.json` | Persist across restarts |
 | `HTTP_ADDR` | no | `:8080` | Health + status server |
 | `LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error` |
@@ -528,7 +535,7 @@ func (s *Store) SetVacuumLastClean(host string, t time.Time) error
 
 **Raspberry Pi 4+:** `make build-linux-arm64`
 
-**Requirements:** Must be on the same LAN as the Roborock vacuums (local miIO UDP). `STORE_PATH` should point to persistent storage.
+**Requirements:** Cloud mode requires Xiaomi/Mi Home credentials and a resolvable device DID, host, or token. Local mode must be on the same LAN as the Roborock vacuums (local miIO UDP). `STORE_PATH` should point to persistent storage.
 
 ---
 

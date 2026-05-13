@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  verisure-roborock:
+    image: verisure-roborock:latest
+    user: "1000:1000"
+    env_file:
+      - /home/pi/verisure-roborock/.env
+    environment:
+      ROBOROCK_CONTROL: roborock
+      STORE_PATH: /data/state.json
+      ROBOROCK_AUTH_PATH: /data/roborock-auth.json
+      ROBOROCK_HELPER: /app/scripts/roborock_cloud.py
+      ROBOROCK_PYTHON: python3
+      XIAOMI_AUTH_PATH: /data/xiaomi-auth.json
+      HTTP_ADDR: ":8080"
+      CLEAN_COOLDOWN_ENABLED: "false"
+    volumes:
+      - type: bind
+        source: /home/pi/verisure-roborock/data
+        target: /data
+    ports:
+      - target: 8080
+        published: 8083
+        protocol: tcp
+        mode: ingress
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 5
+        window: 2m
+      update_config:
+        order: start-first
+        failure_action: rollback

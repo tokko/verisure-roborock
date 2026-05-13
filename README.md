@@ -2,10 +2,10 @@
 
 Automates your Roborock vacuum(s) based on your Verisure home alarm state.
 
-- **Alarm armed-away** → starts all vacuums (if they haven't cleaned in the last 24 h)
+- **Alarm armed-away** → starts every configured vacuum
 - **Alarm disarmed** → pauses any vacuums it started and sends them back to dock
 
-Runs as a single Go binary on any Linux host on your local network. Communicates with vacuums directly over UDP (no Roborock cloud involved day-to-day).
+Runs as a single Go binary or Docker Swarm service. By default it controls Roborock-app vacuums through the Roborock cloud helper, with Xiaomi/Mi Home cloud and older local UDP miIO transports still available for legacy devices.
 
 ---
 
@@ -15,7 +15,7 @@ Runs as a single Go binary on any Linux host on your local network. Communicates
 curl -sSL https://raw.githubusercontent.com/tokko/verisure-roborock/master/install.sh | bash
 ```
 
-The script installs the binary, walks you through configuration, and optionally installs a systemd service.
+The script installs the binary, walks you through configuration, and optionally installs a systemd service. For the current Raspberry Pi deployment, use the Docker Swarm flow below instead.
 
 ---
 
@@ -27,7 +27,7 @@ The script installs the binary, walks you through configuration, and optionally 
 - Git
 - A Linux host on the same LAN as your Roborock vacuum(s)
 - A Verisure account
-- A Mi Home / Roborock account
+- A Roborock account for Roborock-app devices, or a Mi Home/Xiaomi account for legacy Mi Home-only devices
 
 ### 1. Clone and build
 
@@ -44,9 +44,11 @@ cp .env.example .env
 # Edit .env with your Verisure credentials — Roborock tokens come next.
 ```
 
-### 3. Fetch Roborock device tokens
+### 3. Configure Roborock devices
 
-The vacuum's local token is separate from your account password. Fetch it automatically using your Mi Home credentials:
+For Roborock-app devices, set `ROBOROCK_CONTROL=roborock` and configure each vacuum by name, host/IP, or Roborock device ID. The service uses `ROBOROCK_AUTH_PATH` to cache the Roborock cloud sign-in.
+
+Legacy Mi Home-only robots can use `ROBOROCK_N_BACKEND=xiaomi`. Local UDP mode is still available with `ROBOROCK_CONTROL=local`, but it requires the vacuum's local token, which is separate from your account password. Fetch local/Xiaomi details with:
 
 ```bash
 make fetch-tokens
@@ -56,11 +58,12 @@ Output looks like:
 
 ```
 ROBOROCK_0_HOST=192.168.1.50
+ROBOROCK_0_DID=123456789
 ROBOROCK_0_TOKEN=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
 ROBOROCK_0_NAME=roborock-s5
 ```
 
-Paste those lines into your `.env`.
+Paste the relevant lines into your `.env`.
 
 ### 4. Run
 
@@ -85,16 +88,24 @@ All configuration is via environment variables (or `.env`). Run `make fetch-toke
 | `VERISURE_MFA_PHONE` | no | — | Phone number for SMS 2FA |
 | `ROBOROCK_EMAIL` | no | `VERISURE_EMAIL` | Roborock account email (if different from Verisure) |
 | `ROBOROCK_PASSWORD` | no | `VERISURE_PASSWORD` | Roborock account password (if different) |
-| `XIAOMI_EMAIL` | no | `VERISURE_EMAIL` | Mi Home email (Mi Home app users only) |
-| `XIAOMI_PASSWORD` | no | `VERISURE_PASSWORD` | Mi Home password (Mi Home app users only) |
+| `ROBOROCK_CONTROL` | no | `roborock` | `roborock`/`cloud` for Roborock app, `xiaomi` for Mi Home, `mixed`, or `local` |
+| `ROBOROCK_AUTH_PATH` | no | `./roborock-auth.json` | Cached Roborock-app auth file |
+| `ROBOROCK_HELPER` | no | `./scripts/roborock_cloud.py` | Roborock app cloud helper script |
+| `ROBOROCK_PYTHON` | no | `python3` | Python executable for the helper |
+| `XIAOMI_EMAIL` | no | `ROBOROCK_EMAIL` | Mi Home email (Mi Home app users only) |
+| `XIAOMI_PASSWORD` | no | `ROBOROCK_PASSWORD` | Mi Home password (Mi Home app users only) |
 | `XIAOMI_COUNTRY` | no | `de` | Cloud region: `de` EU, `us`, `sg`, `cn` |
-| `ROBOROCK_0_HOST` | yes | — | First vacuum local IP |
-| `ROBOROCK_0_TOKEN` | yes | — | First vacuum token (from `make fetch-tokens`) |
+| `XIAOMI_AUTH_PATH` | no | `./xiaomi-auth.json` | Cached Mi Home/Xiaomi auth file |
+| `ROBOROCK_0_HOST` | local: yes | — | Vacuum local IP; also used as the persisted store key |
+| `ROBOROCK_0_DID` | no | — | Roborock DUID or Xiaomi device ID |
+| `ROBOROCK_0_TOKEN` | local: yes | — | First vacuum token (from `make fetch-tokens`) |
 | `ROBOROCK_0_NAME` | no | `vacuum-0` | Label for logs |
-| `ROBOROCK_N_HOST/TOKEN/NAME` | no | — | Additional vacuums (N = 1, 2, …) |
+| `ROBOROCK_0_BACKEND` | no | `ROBOROCK_CONTROL` | Per-vacuum backend: `roborock`, `xiaomi`, or `local` |
+| `ROBOROCK_N_HOST/DID/TOKEN/NAME` | no | — | Additional vacuums (N = 1, 2, …) |
 | `POLL_INTERVAL` | no | `60s` | How often to poll Verisure |
+| `CLEAN_COOLDOWN_ENABLED` | no | `true` | Set `false` to ignore recent clean history |
 | `CLEAN_COOLDOWN` | no | `24h` | Skip vacuum if it cleaned within this window |
-| `ROBOROCK_TIMEOUT` | no | `10s` | Per-command UDP timeout |
+| `ROBOROCK_TIMEOUT` | no | `10s` | Per-command UDP timeout when `ROBOROCK_CONTROL=local` |
 | `STORE_PATH` | no | `./state.json` | Persistent state file |
 | `HTTP_ADDR` | no | `:8080` | Health and status server |
 | `LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error` |
@@ -167,16 +178,60 @@ ssh pi@192.168.1.10 "systemctl status verisure-roborock"
 curl http://192.168.1.10:8080/status
 ```
 
+## Deployment (Docker Swarm)
+
+Build the image on the Raspberry Pi swarm manager, then deploy the stack:
+
+```bash
+cd /home/pi/verisure-roborock
+mkdir -p data
+docker build -t verisure-roborock:latest .
+docker stack deploy -c docker-compose.yml --resolve-image never verisure-roborock
+```
+
+The stack pins the service to a manager node and bind-mounts `/home/pi/verisure-roborock/data` to `/data` for persistent `state.json`, `roborock-auth.json`, and `xiaomi-auth.json`.
+
+When rebuilding a local `verisure-roborock:latest` image, force the service to restart after the build so Swarm runs the new local image:
+
+```bash
+docker service update --force verisure-roborock_verisure-roborock
+```
+
+To remove the old bare-metal service after the stack is healthy:
+
+```bash
+sudo systemctl disable --now verisure-roborock
+```
+
+## Xiaomi Cloud Sign-In
+
+Cloud mode first tries cached Xiaomi credentials from `XIAOMI_AUTH_PATH` (default `./xiaomi-auth.json`). If `XIAOMI_USER_ID`, `XIAOMI_SSECURITY`, and `XIAOMI_SERVICE_TOKEN` are set in the environment, the app imports them once and writes the cache file.
+
+Headless password login is kept as a fallback, but Xiaomi frequently requires captcha or browser verification. The reliable one-time route is browser-assisted token import:
+
+1. On tokstation, open `https://account.xiaomi.com/pass/serviceLogin?sid=xiaomiio&_json=true`.
+2. If the page returns JSON with a `location` field, copy that `location` URL into the address bar.
+3. Open browser developer tools, enable network logging, and complete the Xiaomi sign-in page.
+4. Capture:
+   - `userId` and `serviceToken` from the `https://sts.api.io.mi.com/sts` response cookies.
+   - `ssecurity` from the `serviceLoginAuth2` response payload.
+5. Add these once to `/home/pi/verisure-roborock/.env` as `XIAOMI_USER_ID`, `XIAOMI_SSECURITY`, and `XIAOMI_SERVICE_TOKEN`.
+6. Start the stack; the app writes `/data/xiaomi-auth.json`. After that, remove the three one-time variables from `.env` if desired.
+
+There is not a stable Xiaomi callback URL that this service can receive directly, so opening a link on tokstation is supported as a manual browser login/import flow rather than as an OAuth-style redirect back to the service.
+
 ---
 
 ## How it works
 
 1. The service polls the Verisure alarm state every 60 s
-2. On transition to **ARMED_AWAY**: for each configured vacuum, it checks the last completed clean time via the local miIO protocol. If >24 h ago (or never), it sends `app_start` (or `app_resume` if paused)
+2. On transition to **ARMED_AWAY**: for each configured vacuum, it checks the last completed clean time through the selected transport when `CLEAN_COOLDOWN_ENABLED=true`. If the cooldown is disabled, it starts eligible vacuums every time the alarm arms away.
 3. On transition to **DISARMED** or **ARMED_HOME**: for each vacuum it started, it sends `app_pause` then `app_charge` (return to dock)
 4. On restart: reconciles persisted state against current alarm and vacuum states before entering the poll loop — a vacuum will never be left running unattended after a crash
 
-Vacuums are controlled directly over UDP on your LAN using the [miIO binary protocol](https://github.com/rytilahti/python-miio/blob/master/miio/protocol.py). No Roborock cloud involved.
+If one vacuum starts but another fails transiently, the controller keeps retrying the pending vacuum while the alarm remains armed. Roborock cloud `app_start` also retries the common `request too frequency` / response `9002` rate-limit error with backoff.
+
+Default vacuum control uses the Roborock app cloud helper. Set `ROBOROCK_CONTROL=xiaomi` for Mi Home/Xiaomi Cloud devices or `ROBOROCK_CONTROL=local` to use the direct UDP miIO transport on your LAN.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design document.
 

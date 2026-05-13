@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	applicationID    = "PS_PYTHON"
-	defaultLoginBase = "https://automation01.verisure.com"
+	applicationID     = "PS_PYTHON"
+	defaultLoginBase  = "https://automation01.verisure.com"
 	fallbackLoginBase = "https://automation02.verisure.com"
 )
 
@@ -450,11 +450,11 @@ func (c *Client) requestTrustLocked(ctx context.Context, loginBase, stepupCookie
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		slog.Warn("verisure: /auth/trust non-200, re-login may require MFA again",
-			"status", resp.StatusCode, "body", string(body))
+			"status", resp.StatusCode, "body_len", len(body))
 		return
 	}
 	cookies := resp.Cookies()
-	slog.Info("verisure: /auth/trust response", "cookies_count", len(cookies), "body", string(body))
+	slog.Info("verisure: /auth/trust response", "cookies_count", len(cookies), "body_len", len(body))
 	for _, ck := range cookies {
 		slog.Info("verisure: /auth/trust set-cookie", "name", ck.Name,
 			"value_len", len(ck.Value), "path", ck.Path, "domain", ck.Domain)

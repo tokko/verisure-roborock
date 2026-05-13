@@ -152,3 +152,209 @@ func TestParseIndex(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadRoborockControl(t *testing.T) {
+	t.Run("loads clean cooldown feature flag", func(t *testing.T) {
+		withEnv(t, map[string]string{
+			"VERISURE_EMAIL":         "v@example.com",
+			"VERISURE_PASSWORD":      "secret",
+			"ROBOROCK_CONTROL":       "roborock",
+			"ROBOROCK_0_NAME":        "upstairs",
+			"CLEAN_COOLDOWN_ENABLED": "false",
+			"CLEAN_COOLDOWN":         "24h",
+			"ROBOROCK_0_HOST":        "",
+			"ROBOROCK_0_TOKEN":       "",
+			"ROBOROCK_TIMEOUT":       "",
+			"POLL_INTERVAL":          "",
+			"STORE_PATH":             "",
+			"HTTP_ADDR":              "",
+			"LOG_LEVEL":              "",
+			"VERISURE_BASE_URL":      "",
+			"VERISURE_GIID":          "",
+			"VERISURE_MFA_PHONE":     "",
+			"ROBOROCK_AUTH_PATH":     "",
+			"XIAOMI_AUTH_PATH":       "",
+			"XIAOMI_USER_ID":         "",
+			"XIAOMI_SSECURITY":       "",
+			"XIAOMI_SERVICE_TOKEN":   "",
+			"ROBOROCK_0_DID":         "",
+			"ROBOROCK_0_BACKEND":     "",
+			"ROBOROCK_1_HOST":        "",
+			"ROBOROCK_1_TOKEN":       "",
+			"ROBOROCK_1_NAME":        "",
+			"ROBOROCK_1_DID":         "",
+			"ROBOROCK_1_BACKEND":     "",
+		})
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.CleanCooldownEnabled {
+			t.Fatal("CleanCooldownEnabled = true, want false")
+		}
+	})
+
+	t.Run("roborock cloud mode accepts named app devices without local token", func(t *testing.T) {
+		withEnv(t, map[string]string{
+			"VERISURE_EMAIL":       "v@example.com",
+			"VERISURE_PASSWORD":    "secret",
+			"ROBOROCK_CONTROL":     "roborock",
+			"ROBOROCK_0_NAME":      "upstairs",
+			"ROBOROCK_1_NAME":      "downstairs",
+			"ROBOROCK_1_HOST":      "192.0.2.20",
+			"ROBOROCK_EMAIL":       "r@example.com",
+			"ROBOROCK_PASSWORD":    "rr-secret",
+			"XIAOMI_COUNTRY":       "de",
+			"XIAOMI_AUTH_PATH":     "/data/xiaomi-auth.json",
+			"ROBOROCK_AUTH_PATH":   "/data/roborock-auth.json",
+			"XIAOMI_USER_ID":       "42",
+			"XIAOMI_SSECURITY":     "sec",
+			"XIAOMI_SERVICE_TOKEN": "token",
+			"ROBOROCK_0_HOST":      "",
+			"ROBOROCK_0_TOKEN":     "",
+			"ROBOROCK_TIMEOUT":     "",
+			"POLL_INTERVAL":        "",
+			"CLEAN_COOLDOWN":       "",
+			"STORE_PATH":           "",
+			"HTTP_ADDR":            "",
+			"LOG_LEVEL":            "",
+			"VERISURE_BASE_URL":    "",
+			"VERISURE_GIID":        "",
+			"VERISURE_MFA_PHONE":   "",
+		})
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.RoborockControl != "roborock" {
+			t.Fatalf("RoborockControl = %q, want roborock", cfg.RoborockControl)
+		}
+		if got := cfg.Vacuums[0].Backend; got != "roborock" {
+			t.Fatalf("Backend = %q, want roborock", got)
+		}
+		if got := cfg.Vacuums[0].Host; got != "upstairs" {
+			t.Fatalf("roborock store key Host = %q, want name fallback", got)
+		}
+		if got := cfg.XiaomiEmail; got != "r@example.com" {
+			t.Fatalf("XiaomiEmail = %q, want Roborock fallback", got)
+		}
+		if got := cfg.RoborockAuthPath; got != "/data/roborock-auth.json" {
+			t.Fatalf("RoborockAuthPath = %q", got)
+		}
+		if cfg.XiaomiAuthPath != "/data/xiaomi-auth.json" || !cfg.XiaomiAuth.Complete() {
+			t.Fatalf("xiaomi auth config not loaded: %+v path=%q", cfg.XiaomiAuth, cfg.XiaomiAuthPath)
+		}
+	})
+
+	t.Run("per-vacuum backend can keep Xiaomi-only Gizmo separate", func(t *testing.T) {
+		withEnv(t, map[string]string{
+			"VERISURE_EMAIL":     "v@example.com",
+			"VERISURE_PASSWORD":  "secret",
+			"ROBOROCK_CONTROL":   "roborock",
+			"ROBOROCK_0_NAME":    "upstairs",
+			"ROBOROCK_1_NAME":    "gizmo",
+			"ROBOROCK_1_BACKEND": "xiaomi",
+			"ROBOROCK_1_DID":     "118097498",
+		})
+
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Vacuums[0].Backend != "roborock" || cfg.Vacuums[1].Backend != "xiaomi" {
+			t.Fatalf("backends = %q/%q, want roborock/xiaomi", cfg.Vacuums[0].Backend, cfg.Vacuums[1].Backend)
+		}
+	})
+
+	t.Run("local mode still requires host and token", func(t *testing.T) {
+		withEnv(t, map[string]string{
+			"VERISURE_EMAIL":    "v@example.com",
+			"VERISURE_PASSWORD": "secret",
+			"ROBOROCK_CONTROL":  "local",
+			"ROBOROCK_0_DID":    "123456789",
+		})
+
+		_, err := Load()
+		if err == nil {
+			t.Fatal("Load succeeded, want missing host/token error")
+		}
+		if !strings.Contains(err.Error(), "ROBOROCK_0_HOST") ||
+			!strings.Contains(err.Error(), "ROBOROCK_0_TOKEN") {
+			t.Fatalf("error = %q, want missing host and token", err)
+		}
+	})
+}
+
+func withEnv(t *testing.T, vals map[string]string) {
+	t.Helper()
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldWD); err != nil {
+			t.Fatal(err)
+		}
+	})
+	keys := []string{
+		"VERISURE_EMAIL",
+		"VERISURE_PASSWORD",
+		"VERISURE_GIID",
+		"VERISURE_BASE_URL",
+		"VERISURE_MFA_PHONE",
+		"ROBOROCK_EMAIL",
+		"ROBOROCK_PASSWORD",
+		"ROBOROCK_CONTROL",
+		"ROBOROCK_AUTH_PATH",
+		"ROBOROCK_PYTHON",
+		"ROBOROCK_HELPER",
+		"XIAOMI_EMAIL",
+		"XIAOMI_PASSWORD",
+		"XIAOMI_COUNTRY",
+		"XIAOMI_AUTH_PATH",
+		"XIAOMI_USER_ID",
+		"XIAOMI_SSECURITY",
+		"XIAOMI_SERVICE_TOKEN",
+		"ROBOROCK_0_HOST",
+		"ROBOROCK_0_TOKEN",
+		"ROBOROCK_0_NAME",
+		"ROBOROCK_0_DID",
+		"ROBOROCK_0_BACKEND",
+		"ROBOROCK_1_HOST",
+		"ROBOROCK_1_TOKEN",
+		"ROBOROCK_1_NAME",
+		"ROBOROCK_1_DID",
+		"ROBOROCK_1_BACKEND",
+		"ROBOROCK_TIMEOUT",
+		"POLL_INTERVAL",
+		"CLEAN_COOLDOWN",
+		"CLEAN_COOLDOWN_ENABLED",
+		"STORE_PATH",
+		"HTTP_ADDR",
+		"LOG_LEVEL",
+	}
+	for _, key := range keys {
+		old, ok := os.LookupEnv(key)
+		if v, exists := vals[key]; exists {
+			if v == "" {
+				os.Unsetenv(key)
+			} else {
+				os.Setenv(key, v)
+			}
+		} else {
+			os.Unsetenv(key)
+		}
+		t.Cleanup(func() {
+			if ok {
+				os.Setenv(key, old)
+			} else {
+				os.Unsetenv(key)
+			}
+		})
+	}
+}
