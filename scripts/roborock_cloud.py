@@ -184,16 +184,25 @@ async def q10_summary(props: Any) -> list[Any]:
 
 
 async def q10_command(props: Any, command: str, params: Any) -> Any:
-    commands = {
-        "app_start": B01_Q10_DP.START_CLEAN,
-        "app_resume": B01_Q10_DP.RESUME,
-        "app_pause": B01_Q10_DP.PAUSE,
-        "app_charge": B01_Q10_DP.START_BACK,
-    }
-    mapped = commands.get(command)
+    mapped = q10_command_payload(command, params)
     if not mapped:
         raise RuntimeError(f"B01/Q10 command {command!r} is not supported")
-    return await props.command.send(mapped, params=params or {})
+    dp, payload = mapped
+    return await props.command.send(dp, params=payload)
+
+
+def q10_command_payload(command: str, params: Any) -> tuple[Any, Any] | None:
+    if command == "app_start":
+        return B01_Q10_DP.START_CLEAN, params or {"cmd": 1}
+    if command == "app_resume":
+        return B01_Q10_DP.RESUME, params or {}
+    if command == "app_pause":
+        return B01_Q10_DP.PAUSE, params or {}
+    if command == "app_charge":
+        return B01_Q10_DP.START_DOCK_TASK, params or {}
+    if command == "app_stop":
+        return B01_Q10_DP.STOP, params or {}
+    return None
 
 
 async def run_command(device: Any, command: str, params: Any) -> Any:
