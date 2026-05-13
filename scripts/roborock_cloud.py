@@ -192,6 +192,12 @@ async def q10_command(props: Any, command: str, params: Any) -> Any:
 
 
 def q10_command_payload(command: str, params: Any) -> tuple[Any, Any] | None:
+    if command == "set_fan_balanced":
+        return B01_Q10_DP.FAN_LEVEL, 2
+    if command == "set_clean_vacuum_only":
+        return B01_Q10_DP.CLEAN_MODE, 2
+    if command == "set_mop_water_off":
+        return B01_Q10_DP.WATER_LEVEL, 0
     if command == "app_start":
         return B01_Q10_DP.START_CLEAN, params or {"cmd": 1}
     if command == "app_resume":
@@ -209,6 +215,14 @@ async def run_command(device: Any, command: str, params: Any) -> Any:
     if props := getattr(device, "v1_properties", None):
         if not getattr(props, "command", None):
             raise RuntimeError(f"device {getattr(device, 'name', '')!r} has invalid v1 command state")
+        if command == "set_fan_balanced":
+            command = "set_custom_mode"
+            params = [102]
+        elif command == "set_mop_water_off":
+            command = "set_water_box_custom_mode"
+            params = [200]
+        elif command == "set_clean_vacuum_only":
+            return ["ok"]
         result = await props.command.send(command, params)
         if command == "get_clean_summary" and isinstance(result, dict):
             return [

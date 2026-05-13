@@ -7,6 +7,8 @@ Automates your Roborock vacuum(s) based on your Verisure home alarm state.
 
 Runs as a single Go binary or Docker Swarm service. By default it controls Roborock-app vacuums through the Roborock cloud helper, with Xiaomi/Mi Home cloud and older local UDP miIO transports still available for legacy devices.
 
+Roborock-app robots are prepared for balanced vacuum-only cleaning before each full or room clean: balanced suction, vacuum-only clean mode where supported, and mop water off.
+
 ---
 
 ## Quick start

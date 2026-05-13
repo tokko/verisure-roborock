@@ -6,6 +6,9 @@ from pathlib import Path
 
 
 class _FakeB01Q10DP:
+    CLEAN_MODE = "CLEAN_MODE"
+    FAN_LEVEL = "FAN_LEVEL"
+    WATER_LEVEL = "WATER_LEVEL"
     START_CLEAN = "START_CLEAN"
     RESUME = "RESUME"
     PAUSE = "PAUSE"
@@ -70,6 +73,20 @@ class Q10CommandPayloadTest(unittest.TestCase):
 
         self.assertEqual(dp, _FakeB01Q10DP.START_CLEAN)
         self.assertEqual(payload, {"cmd": 4})
+
+    def test_q10_balanced_vacuum_only_mode_commands(self):
+        self.assertEqual(
+            self.helper.q10_command_payload("set_fan_balanced", None),
+            (_FakeB01Q10DP.FAN_LEVEL, 2),
+        )
+        self.assertEqual(
+            self.helper.q10_command_payload("set_clean_vacuum_only", None),
+            (_FakeB01Q10DP.CLEAN_MODE, 2),
+        )
+        self.assertEqual(
+            self.helper.q10_command_payload("set_mop_water_off", None),
+            (_FakeB01Q10DP.WATER_LEVEL, 0),
+        )
 
 
 if __name__ == "__main__":

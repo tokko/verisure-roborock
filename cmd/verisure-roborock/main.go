@@ -193,7 +193,7 @@ func run() error {
 		Addr:              cfg.HTTPAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      2 * time.Minute,
+		WriteTimeout:      5 * time.Minute,
 		IdleTimeout:       60 * time.Second,
 	}
 	go func() {

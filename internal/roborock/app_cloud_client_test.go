@@ -75,6 +75,9 @@ func TestRoborockAppVacuumCommandsUseCloudRunner(t *testing.T) {
 	want := []appRunnerCall{
 		{selector: "upstairs", command: "get_status"},
 		{selector: "upstairs", command: "get_clean_summary"},
+		{selector: "upstairs", command: "set_fan_balanced", params: []any{}},
+		{selector: "upstairs", command: "set_clean_vacuum_only", params: []any{}},
+		{selector: "upstairs", command: "set_mop_water_off", params: []any{}},
 		{selector: "upstairs", command: "app_start", params: []any{}},
 		{selector: "upstairs", command: "app_pause", params: []any{}},
 		{selector: "upstairs", command: "app_charge", params: []any{}},
@@ -101,10 +104,16 @@ func TestRoborockAppVacuumCleanRooms(t *testing.T) {
 	if err := v.CleanRooms(context.Background(), []int{16, 17}, 2); err != nil {
 		t.Fatalf("CleanRooms: %v", err)
 	}
-	if len(runner.calls) != 1 {
-		t.Fatalf("calls = %d, want 1", len(runner.calls))
+	wantCommands := []string{"set_fan_balanced", "set_clean_vacuum_only", "set_mop_water_off", "app_segment_clean"}
+	if len(runner.calls) != len(wantCommands) {
+		t.Fatalf("calls = %d, want %d: %+v", len(runner.calls), len(wantCommands), runner.calls)
 	}
-	got := runner.calls[0]
+	for i, command := range wantCommands {
+		if runner.calls[i].command != command {
+			t.Fatalf("call %d command = %q, want %q", i, runner.calls[i].command, command)
+		}
+	}
+	got := runner.calls[3]
 	if got.command != "app_segment_clean" {
 		t.Fatalf("command = %q", got.command)
 	}
@@ -132,9 +141,15 @@ func TestRoborockAppVacuumStartRetriesRateLimit(t *testing.T) {
 
 	runner := &fakeRoborockAppRunner{
 		resp: map[string]json.RawMessage{
-			"app_start": json.RawMessage(`["ok"]`),
+			"set_fan_balanced":      json.RawMessage(`["ok"]`),
+			"set_clean_vacuum_only": json.RawMessage(`["ok"]`),
+			"set_mop_water_off":     json.RawMessage(`["ok"]`),
+			"app_start":             json.RawMessage(`["ok"]`),
 		},
 		errSeq: []error{
+			nil,
+			nil,
+			nil,
 			errors.New(`request too frequency - response code: 9002`),
 			nil,
 		},
@@ -147,8 +162,11 @@ func TestRoborockAppVacuumStartRetriesRateLimit(t *testing.T) {
 	if err := v.StartOrResume(context.Background(), false); err != nil {
 		t.Fatalf("StartOrResume: %v", err)
 	}
-	if len(runner.calls) != 2 {
-		t.Fatalf("app_start calls = %d, want 2", len(runner.calls))
+	if len(runner.calls) != 5 {
+		t.Fatalf("calls = %d, want 5", len(runner.calls))
+	}
+	if runner.calls[3].command != "app_start" || runner.calls[4].command != "app_start" {
+		t.Fatalf("retry commands = %q, %q; want app_start, app_start", runner.calls[3].command, runner.calls[4].command)
 	}
 }
 

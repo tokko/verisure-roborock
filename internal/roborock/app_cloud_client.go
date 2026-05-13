@@ -101,7 +101,8 @@ func (r *SpacedRoborockAppRunner) waitForTurn(ctx context.Context, selector, com
 
 func isRoborockAppControlCommand(command string) bool {
 	switch command {
-	case "app_start", "app_resume", "app_pause", "app_charge", "app_stop", "app_segment_clean":
+	case "app_start", "app_resume", "app_pause", "app_charge", "app_stop", "app_segment_clean",
+		"set_fan_balanced", "set_clean_vacuum_only", "set_mop_water_off":
 		return true
 	default:
 		return false
@@ -149,6 +150,9 @@ func (c *roborockAppVacuum) CleanSummary(ctx context.Context) (CleanSummary, err
 }
 
 func (c *roborockAppVacuum) StartOrResume(ctx context.Context, _ bool) error {
+	if err := c.prepareBalancedVacuumOnly(ctx); err != nil {
+		return err
+	}
 	if err := c.commandWithRateLimitRetry(ctx, "app_start"); err != nil {
 		return err
 	}
@@ -164,10 +168,26 @@ func (c *roborockAppVacuum) CleanRooms(ctx context.Context, rooms []int, repeat 
 		"segments": rooms,
 		"repeat":   repeat,
 	}}
+	if err := c.prepareBalancedVacuumOnly(ctx); err != nil {
+		return err
+	}
 	if err := c.commandWithParamsRateLimitRetry(ctx, "app_segment_clean", params); err != nil {
 		return err
 	}
 	slog.Info("roborock app cloud: room clean started", "name", c.name, "rooms", rooms, "repeat", repeat)
+	return nil
+}
+
+func (c *roborockAppVacuum) prepareBalancedVacuumOnly(ctx context.Context) error {
+	if err := c.commandWithRateLimitRetry(ctx, "set_fan_balanced"); err != nil {
+		return fmt.Errorf("set balanced vacuum power: %w", err)
+	}
+	if err := c.commandWithRateLimitRetry(ctx, "set_clean_vacuum_only"); err != nil {
+		return fmt.Errorf("set vacuum-only clean mode: %w", err)
+	}
+	if err := c.commandWithRateLimitRetry(ctx, "set_mop_water_off"); err != nil {
+		return fmt.Errorf("disable mopping water: %w", err)
+	}
 	return nil
 }
 
