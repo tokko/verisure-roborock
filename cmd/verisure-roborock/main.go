@@ -168,6 +168,7 @@ func run() error {
 	})
 	// MFA code submission endpoint — operator POSTs SMS code here during login.
 	// Protected by MFA_SECRET bearer token when configured.
+	registerRobotHandlers(mux, cfg.Vacuums, vacuums, st)
 	mux.HandleFunc("POST /mfa-code", func(w http.ResponseWriter, r *http.Request) {
 		if cfg.MFASecret != "" {
 			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")

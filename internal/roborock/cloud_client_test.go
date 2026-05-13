@@ -18,10 +18,11 @@ type fakeRPC struct {
 type rpcCall struct {
 	did    string
 	method string
+	params any
 }
 
-func (f *fakeRPC) RPC(_ context.Context, did, method string, _ uint32, _ any) (json.RawMessage, error) {
-	f.calls = append(f.calls, rpcCall{did: did, method: method})
+func (f *fakeRPC) RPC(_ context.Context, did, method string, _ uint32, params any) (json.RawMessage, error) {
+	f.calls = append(f.calls, rpcCall{did: did, method: method, params: params})
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -62,18 +63,54 @@ func TestCloudVacuumCommandsUseCloudRPC(t *testing.T) {
 	}
 
 	want := []rpcCall{
-		{"did-1", "get_status"},
-		{"did-1", "get_clean_summary"},
-		{"did-1", "app_pause"},
-		{"did-1", "app_charge"},
+		{did: "did-1", method: "get_status"},
+		{did: "did-1", method: "get_clean_summary"},
+		{did: "did-1", method: "app_pause"},
+		{did: "did-1", method: "app_charge"},
 	}
 	if len(rpc.calls) != len(want) {
 		t.Fatalf("calls = %+v, want %+v", rpc.calls, want)
 	}
 	for i := range want {
-		if rpc.calls[i] != want[i] {
+		if rpc.calls[i].did != want[i].did || rpc.calls[i].method != want[i].method {
 			t.Fatalf("call %d = %+v, want %+v", i, rpc.calls[i], want[i])
 		}
+	}
+}
+
+func TestCloudVacuumCleanRooms(t *testing.T) {
+	rpc := &fakeRPC{resp: map[string]json.RawMessage{
+		"app_segment_clean": json.RawMessage(`["ok"]`),
+	}}
+	v, err := NewCloudVacuum("downstairs", "192.0.2.11", "did-2", rpc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := v.CleanRooms(context.Background(), []int{21, 22}, 1); err != nil {
+		t.Fatalf("CleanRooms: %v", err)
+	}
+	if len(rpc.calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(rpc.calls))
+	}
+	got := rpc.calls[0]
+	if got.method != "app_segment_clean" {
+		t.Fatalf("method = %q", got.method)
+	}
+	params, ok := got.params.([]any)
+	if !ok || len(params) != 1 {
+		t.Fatalf("params = %#v", got.params)
+	}
+	payload, ok := params[0].(map[string]any)
+	if !ok {
+		t.Fatalf("payload = %#v", params[0])
+	}
+	if payload["repeat"] != 1 {
+		t.Fatalf("repeat = %#v", payload["repeat"])
+	}
+	segments, ok := payload["segments"].([]int)
+	if !ok || len(segments) != 2 || segments[0] != 21 || segments[1] != 22 {
+		t.Fatalf("segments = %#v", payload["segments"])
 	}
 }
 

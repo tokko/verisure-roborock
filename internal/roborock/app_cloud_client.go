@@ -84,6 +84,21 @@ func (c *roborockAppVacuum) StartOrResume(ctx context.Context, _ bool) error {
 	return nil
 }
 
+func (c *roborockAppVacuum) CleanRooms(ctx context.Context, rooms []int, repeat int) error {
+	if repeat <= 0 {
+		repeat = 1
+	}
+	params := []any{map[string]any{
+		"segments": rooms,
+		"repeat":   repeat,
+	}}
+	if err := c.commandWithParamsRateLimitRetry(ctx, "app_segment_clean", params); err != nil {
+		return err
+	}
+	slog.Info("roborock app cloud: room clean started", "name", c.name, "rooms", rooms, "repeat", repeat)
+	return nil
+}
+
 func (c *roborockAppVacuum) Pause(ctx context.Context) error {
 	if err := c.command(ctx, "app_pause"); err != nil {
 		return err
@@ -105,10 +120,10 @@ func (c *roborockAppVacuum) command(ctx context.Context, command string) error {
 	return err
 }
 
-func (c *roborockAppVacuum) commandWithRateLimitRetry(ctx context.Context, command string) error {
+func (c *roborockAppVacuum) commandWithParamsRateLimitRetry(ctx context.Context, command string, params any) error {
 	var err error
 	for attempt := 0; attempt <= len(roborockAppRateLimitBackoff); attempt++ {
-		err = c.command(ctx, command)
+		_, err = c.call(ctx, command, params)
 		if err == nil || !isRoborockAppRateLimit(err) || attempt == len(roborockAppRateLimitBackoff) {
 			return err
 		}
@@ -126,6 +141,10 @@ func (c *roborockAppVacuum) commandWithRateLimitRetry(ctx context.Context, comma
 		}
 	}
 	return err
+}
+
+func (c *roborockAppVacuum) commandWithRateLimitRetry(ctx context.Context, command string) error {
+	return c.commandWithParamsRateLimitRetry(ctx, command, []any{})
 }
 
 func isRoborockAppRateLimit(err error) bool {

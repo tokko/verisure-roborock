@@ -135,6 +135,9 @@ If your account has SMS 2FA enabled:
 |---|---|
 | `GET /healthz` | Returns `200 ok` if the process is alive |
 | `GET /status` | JSON: current alarm state, control state, per-vacuum status |
+| `GET /robots` | Lists configured robots and whether this service started them |
+| `POST /robots/{name-or-host}/start` | Starts or resumes one robot |
+| `POST /robots/{name-or-host}/stop` | Pauses one robot and sends it back to dock |
 | `POST /mfa-code` | Submit Verisure SMS code (body = the 6-digit code) |
 
 Example status response:
@@ -153,6 +156,16 @@ Example status response:
   ]
 }
 ```
+
+Manual start can also request specific rooms/segments when the selected backend supports Roborock's `app_segment_clean` command:
+
+```bash
+curl -X POST http://localhost:8080/robots/upstairs/start \
+  -H 'Content-Type: application/json' \
+  -d '{"rooms":[16,17],"repeat":1}'
+```
+
+Room IDs are the Roborock segment IDs from the robot's map. Classic/local miIO, Xiaomi cloud RPC, and Roborock-app V1 command paths use `app_segment_clean`; B01/Q10 models currently return an unsupported-command error until their room-clean DP mapping is confirmed.
 
 ---
 

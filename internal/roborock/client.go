@@ -27,10 +27,10 @@ type Client struct {
 	keys    keys
 	timeout time.Duration
 
-	mu       sync.Mutex
-	conn     *net.UDPConn
-	deviceID uint32
-	stamp    uint32
+	mu        sync.Mutex
+	conn      *net.UDPConn
+	deviceID  uint32
+	stamp     uint32
 	handshook bool
 
 	msgID atomic.Uint32
@@ -191,6 +191,21 @@ func (c *Client) StartOrResume(ctx context.Context, paused bool) error {
 		return err
 	}
 	slog.Info("roborock: started", "name", c.name)
+	return nil
+}
+
+func (c *Client) CleanRooms(ctx context.Context, rooms []int, repeat int) error {
+	if repeat <= 0 {
+		repeat = 1
+	}
+	params := []any{map[string]any{
+		"segments": rooms,
+		"repeat":   repeat,
+	}}
+	if _, err := c.call(ctx, "app_segment_clean", params); err != nil {
+		return err
+	}
+	slog.Info("roborock: room clean started", "name", c.name, "rooms", rooms, "repeat", repeat)
 	return nil
 }
 

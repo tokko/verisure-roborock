@@ -141,6 +141,21 @@ func (c *CloudVacuum) StartOrResume(ctx context.Context, paused bool) error {
 	return nil
 }
 
+func (c *CloudVacuum) CleanRooms(ctx context.Context, rooms []int, repeat int) error {
+	if repeat <= 0 {
+		repeat = 1
+	}
+	params := []any{map[string]any{
+		"segments": rooms,
+		"repeat":   repeat,
+	}}
+	if _, err := c.call(ctx, "app_segment_clean", params); err != nil {
+		return err
+	}
+	slog.Info("roborock cloud: room clean started", "name", c.name, "rooms", rooms, "repeat", repeat)
+	return nil
+}
+
 func (c *CloudVacuum) Pause(ctx context.Context) error {
 	if err := c.command(ctx, "app_pause"); err != nil {
 		return err
