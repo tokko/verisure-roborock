@@ -145,7 +145,7 @@ def q10_state_id(status: dict[str, Any]) -> int:
     state = str(status.get("status") or "").casefold()
     task = str(status.get("cleanTaskType") or "").casefold()
     back_type = str(status.get("backType") or "").casefold()
-    if "clean" in state or "clean" in task:
+    if "clean" in state or "sweep" in state or "clean" in task:
         return 5
     if "pause" in state or "pause" in task:
         return 10

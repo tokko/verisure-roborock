@@ -95,6 +95,12 @@ class Q10CommandPayloadTest(unittest.TestCase):
         )
         self.assertEqual(self.helper.q10_state_id({"status": "returning", "backType": "backcharging"}), 6)
 
+    def test_sweeping_takes_precedence_over_stale_back_type(self):
+        self.assertEqual(
+            self.helper.q10_state_id({"status": "sweeping", "cleanTaskType": "smart", "backType": "backcharging"}),
+            5,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
