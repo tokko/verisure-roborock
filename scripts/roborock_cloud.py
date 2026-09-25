@@ -149,7 +149,7 @@ def q10_state_id(status: dict[str, Any]) -> int:
         return 5
     if "pause" in state or "pause" in task:
         return 10
-    if "charge" in state:
+    if "charg" in state:
         return 8
     if "back" in state or "back" in back_type or "return" in state:
         return 6

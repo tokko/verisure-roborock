@@ -88,6 +88,13 @@ class Q10CommandPayloadTest(unittest.TestCase):
             (_FakeB01Q10DP.WATER_LEVEL, 0),
         )
 
+    def test_charging_takes_precedence_over_stale_back_type(self):
+        self.assertEqual(
+            self.helper.q10_state_id({"status": "charging", "backType": "backcharging", "battery": 100}),
+            8,
+        )
+        self.assertEqual(self.helper.q10_state_id({"status": "returning", "backType": "backcharging"}), 6)
+
 
 if __name__ == "__main__":
     unittest.main()
