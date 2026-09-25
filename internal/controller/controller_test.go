@@ -410,7 +410,7 @@ func TestOnDisengaged(t *testing.T) {
 		}
 	})
 
-	t.Run("not CleaningActive -> idle, no action", func(t *testing.T) {
+	t.Run("not CleaningActive but StartedByUs -> stop", func(t *testing.T) {
 		v := &mockVacuum{name: "v", host: "1.1.1.1",
 			status: roborock.VacuumStatus{State: roborock.StateCleaning}}
 		st := newStore(t)
@@ -420,8 +420,8 @@ func TestOnDisengaged(t *testing.T) {
 		c := New(&mockAlarm{}, []VacuumCommander{v}, st, time.Second, time.Hour)
 		c.state = StateArmedAway
 		c.onDisengaged(context.Background())
-		assertBool(t, "pause called", v.pauseCalled, false)
-		assertBool(t, "charge called", v.chargeCalled, false)
+		assertBool(t, "pause called", v.pauseCalled, true)
+		assertBool(t, "charge called", v.chargeCalled, true)
 		if c.State() != StateIdle {
 			t.Errorf("state: got %v, want Idle", c.State())
 		}
@@ -439,6 +439,27 @@ func TestOnDisengaged(t *testing.T) {
 		c.onDisengaged(context.Background())
 		assertBool(t, "pause called", v.pauseCalled, false)
 		assertBool(t, "charge called", v.chargeCalled, false)
+	})
+
+	t.Run("StartedByUs + error -> request dock and keep ownership", func(t *testing.T) {
+		v := &mockVacuum{name: "v", host: "1.1.1.1",
+			status: roborock.VacuumStatus{State: roborock.StateError, ErrorCode: 5}}
+		st := newStore(t)
+		if err := st.SetVacuumStartedByUs(v.host, true); err != nil {
+			t.Fatal(err)
+		}
+		c := New(&mockAlarm{state: verisure.ArmStateDisarmed}, []VacuumCommander{v}, st, time.Second, time.Hour)
+		c.lastAlarm = verisure.ArmStateDisarmed
+		c.poll(context.Background())
+		assertBool(t, "pause called", v.pauseCalled, false)
+		assertBool(t, "charge called", v.chargeCalled, true)
+		assertBool(t, "ownership retained", st.Get().Vacuums[v.host].StartedByUs, true)
+
+		v.status.State = roborock.StateCharging
+		v.chargeCalled = false
+		c.poll(context.Background())
+		assertBool(t, "charge not repeated after docking", v.chargeCalled, false)
+		assertBool(t, "ownership cleared after docking", st.Get().Vacuums[v.host].StartedByUs, false)
 	})
 }
 

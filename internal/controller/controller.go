@@ -150,6 +150,10 @@ func (c *Controller) poll(ctx context.Context) bool {
 	slog.Debug("controller: polled alarm", "state", alarm)
 
 	if alarm == c.lastAlarm {
+		if alarm.IsDisengaged() && c.hasStartedVacuums() {
+			slog.Info("controller: alarm disengaged with pending vacuum — retrying dock")
+			c.onDisengaged(ctx)
+		}
 		// If armed-away but no vacuums are running yet, retry on every poll.
 		// This handles the common case where vacuums are sleeping or still
 		// re-connecting to WiFi when the alarm is first set — they'll be
@@ -216,6 +220,16 @@ func (c *Controller) hasUnstartedVacuums() bool {
 	st := c.store.Get()
 	for _, v := range c.vacuums {
 		if !st.Vacuums[v.Host()].StartedByUs {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Controller) hasStartedVacuums() bool {
+	st := c.store.Get()
+	for _, v := range c.vacuums {
+		if st.Vacuums[v.Host()].StartedByUs {
 			return true
 		}
 	}
@@ -312,7 +326,7 @@ func (c *Controller) startVacuum(ctx context.Context, v VacuumCommander, status 
 
 // onDisengaged iterates all vacuums we started and pauses + docks them.
 func (c *Controller) onDisengaged(ctx context.Context) {
-	if c.state != StateCleaningActive {
+	if !c.hasStartedVacuums() {
 		slog.Info("controller: alarm disengaged but nothing active — no action")
 		c.setState(StateIdle)
 		return
@@ -337,6 +351,8 @@ func (c *Controller) stopVacuum(ctx context.Context, v VacuumCommander) {
 	status, err := v.Status(ctx)
 	if err != nil {
 		slog.Warn("controller: cannot get status before stop, attempting pause anyway", "name", v.Name(), "err", err)
+	} else if status.State.IsError() {
+		slog.Warn("controller: vacuum in error state, attempting dock", "name", v.Name(), "code", status.ErrorCode)
 	} else if !status.State.IsActiveClean() && !status.State.IsPaused() {
 		slog.Info("controller: vacuum not cleaning, skipping stop", "name", v.Name(), "state", status.State)
 		if persistErr := c.store.SetVacuumStartedByUs(v.Host(), false); persistErr != nil {
@@ -346,17 +362,23 @@ func (c *Controller) stopVacuum(ctx context.Context, v VacuumCommander) {
 	}
 
 	slog.Info("controller: stopping vacuum", "name", v.Name(), "state", status.State)
-	if err := withRetrySingle(ctx, 3, 2*time.Second, 30*time.Second, func() error {
-		return v.Pause(ctx)
-	}); err != nil {
-		slog.Error("controller: pause failed", "name", v.Name(), "err", err)
-		// Continue to try charge anyway.
+	if err != nil || !status.State.IsError() {
+		if err := withRetrySingle(ctx, 3, 2*time.Second, 30*time.Second, func() error {
+			return v.Pause(ctx)
+		}); err != nil {
+			slog.Error("controller: pause failed", "name", v.Name(), "err", err)
+			// Continue to try charge anyway.
+		}
 	}
 
 	if err := withRetrySingle(ctx, 3, 2*time.Second, 30*time.Second, func() error {
 		return v.Charge(ctx)
 	}); err != nil {
 		slog.Error("controller: charge (return to dock) failed", "name", v.Name(), "err", err)
+		return // Keep StartedByUs so the next disarmed poll retries.
+	}
+	if err == nil && status.State.IsError() {
+		return // Recheck on the next poll; an accepted command may not clear a latched error.
 	}
 
 	if err := c.store.SetVacuumStartedByUs(v.Host(), false); err != nil {
@@ -416,7 +438,7 @@ func (c *Controller) reconcileOnStartup(ctx context.Context) {
 		}
 
 		switch {
-		case alarm.IsDisengaged() && (status.State.IsActiveClean() || status.State.IsPaused()):
+		case alarm.IsDisengaged():
 			// We were down while the alarm was disarmed — stop the vacuum.
 			slog.Warn("controller: vacuum still running after alarm disarmed, stopping", "name", v.Name())
 			c.stopVacuum(ctx, v)
