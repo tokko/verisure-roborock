@@ -5,7 +5,7 @@ Automates your Roborock vacuum(s) based on your Verisure home alarm state.
 - **Alarm armed-away** → starts every configured vacuum
 - **Alarm disarmed** → pauses any vacuums it started and sends them back to dock
 
-Runs as a single Go binary or Docker Swarm service. By default it controls Roborock-app vacuums through the Roborock cloud helper, with Xiaomi/Mi Home cloud and older local UDP miIO transports still available for legacy devices.
+Runs as a single Go binary or Docker Compose service. By default it controls Roborock-app vacuums through the Roborock cloud helper, with Xiaomi/Mi Home cloud and older local UDP miIO transports still available for legacy devices.
 
 Roborock-app robots are prepared for balanced vacuum-only cleaning before each full or room clean: balanced suction, vacuum-only clean mode where supported, and mop water off.
 
@@ -17,7 +17,7 @@ Roborock-app robots are prepared for balanced vacuum-only cleaning before each f
 curl -sSL https://raw.githubusercontent.com/tokko/verisure-roborock/master/install.sh | bash
 ```
 
-The script installs the binary, walks you through configuration, and optionally installs a systemd service. For the current Raspberry Pi deployment, use the Docker Swarm flow below instead.
+The script installs the binary, walks you through configuration, and optionally installs a systemd service. For the current Raspberry Pi deployment, use the Docker Compose flow below instead.
 
 ---
 
@@ -91,6 +91,7 @@ All configuration is via environment variables (or `.env`). Run `make fetch-toke
 | `ROBOROCK_EMAIL` | no | `VERISURE_EMAIL` | Roborock account email (if different from Verisure) |
 | `ROBOROCK_PASSWORD` | no | `VERISURE_PASSWORD` | Roborock account password (if different) |
 | `ROBOROCK_CONTROL` | no | `roborock` | `roborock`/`cloud` for Roborock app, `xiaomi` for Mi Home, `mixed`, or `local` |
+| `ROBOROCK_BASE_URL` | no | auto | Roborock sign-in region; the Pi Compose deployment pins `https://euiot.roborock.com` for the EU account |
 | `ROBOROCK_AUTH_PATH` | no | `./roborock-auth.json` | Cached Roborock-app auth file |
 | `ROBOROCK_HELPER` | no | `./scripts/roborock_cloud.py` | Roborock app cloud helper script |
 | `ROBOROCK_PYTHON` | no | `python3` | Python executable for the helper |
@@ -196,26 +197,27 @@ ssh pi@192.168.1.10 "systemctl status verisure-roborock"
 curl http://192.168.1.10:8080/status
 ```
 
-## Deployment (Docker Swarm)
+## Deployment (Docker Compose)
 
-Build the image on the Raspberry Pi swarm manager, then deploy the stack:
-
-```bash
-cd /home/pi/verisure-roborock
-mkdir -p data
-docker build -t verisure-roborock:latest .
-docker stack deploy -c docker-compose.yml --resolve-image never verisure-roborock
-```
-
-The stack pins the service to a manager node and bind-mounts `/home/pi/verisure-roborock/data` to `/data` for persistent `state.json`, `roborock-auth.json`, and `xiaomi-auth.json`.
-
-When rebuilding a local `verisure-roborock:latest` image, force the service to restart after the build so Swarm runs the new local image:
+Build and run the service on the Raspberry Pi:
 
 ```bash
-docker service update --force verisure-roborock_verisure-roborock
+cd /home/pi/verisure-roborock-compose
+mkdir -p /home/pi/verisure-roborock/data
+docker compose up -d --build
 ```
 
-To remove the old bare-metal service after the stack is healthy:
+Compose bind-mounts `/home/pi/verisure-roborock/data` to `/data` for persistent `state.json`, `roborock-auth.json`, and `xiaomi-auth.json`. No host port is published; the HTTP health, status, and MFA endpoints are available only inside the container. Check the service with `docker compose ps` and `docker compose logs --tail=100`.
+
+If Verisure SMS MFA is requested, submit the code from the Pi without exposing a port:
+
+```bash
+read -rs code
+printf '%s' "$code" | docker compose exec -T verisure-roborock python3 -c 'import sys, urllib.request; urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:8080/mfa-code", data=sys.stdin.buffer.read())).read()'
+unset code
+```
+
+To remove the old bare-metal service after the Compose service is healthy:
 
 ```bash
 sudo systemctl disable --now verisure-roborock
@@ -234,7 +236,7 @@ Headless password login is kept as a fallback, but Xiaomi frequently requires ca
    - `userId` and `serviceToken` from the `https://sts.api.io.mi.com/sts` response cookies.
    - `ssecurity` from the `serviceLoginAuth2` response payload.
 5. Add these once to `/home/pi/verisure-roborock/.env` as `XIAOMI_USER_ID`, `XIAOMI_SSECURITY`, and `XIAOMI_SERVICE_TOKEN`.
-6. Start the stack; the app writes `/data/xiaomi-auth.json`. After that, remove the three one-time variables from `.env` if desired.
+6. Start the Compose service; the app writes `/data/xiaomi-auth.json`. After that, remove the three one-time variables from `.env` if desired.
 
 There is not a stable Xiaomi callback URL that this service can receive directly, so opening a link on tokstation is supported as a manual browser login/import flow rather than as an OAuth-style redirect back to the service.
 

@@ -78,7 +78,7 @@ async def login_code(req: dict[str, Any]) -> None:
     email = req["email"]
     auth_path = req["auth_path"]
     code = req["code"]
-    api = RoborockApiClient(username=email)
+    api = RoborockApiClient(username=email, base_url=os.environ.get("ROBOROCK_BASE_URL"))
     load_pending_login(api, auth_path)
     user_data = await api.code_login(code)
     save_user_data(auth_path, user_data)
@@ -90,7 +90,7 @@ async def login_password(req: dict[str, Any]) -> None:
     email = req["email"]
     auth_path = req["auth_path"]
     password = req["password"]
-    api = RoborockApiClient(username=email)
+    api = RoborockApiClient(username=email, base_url=os.environ.get("ROBOROCK_BASE_URL"))
     user_data = await api.pass_login(password)
     save_user_data(auth_path, user_data)
     write({"ok": True})
@@ -98,7 +98,7 @@ async def login_password(req: dict[str, Any]) -> None:
 
 async def request_code(req: dict[str, Any]) -> None:
     auth_path = req.get("auth_path")
-    api = RoborockApiClient(username=req["email"])
+    api = RoborockApiClient(username=req["email"], base_url=os.environ.get("ROBOROCK_BASE_URL"))
     await api.request_code()
     if auth_path:
         save_pending_login(api, auth_path)
@@ -107,7 +107,7 @@ async def request_code(req: dict[str, Any]) -> None:
 
 async def with_devices(req: dict[str, Any]):
     user_data = load_user_data(req["auth_path"])
-    params = UserParams(username=req["email"], user_data=user_data)
+    params = UserParams(username=req["email"], user_data=user_data, base_url=os.environ.get("ROBOROCK_BASE_URL"))
     manager = await create_device_manager(params)
     try:
         return manager, await manager.get_devices()
